@@ -1160,6 +1160,13 @@ function RefGrid({ refs }) {
 }
 
 function ChecksPanel({ s, finished }) {
+  const cards = useValue($cards)
+  const doneId = s.done && s.done.run_id
+  useEffect(() => {
+    // The finished run's card carries the same plain headline as the report and chat messages.
+    if (finished && doneId) loadCard(doneId).catch(() => {})
+  }, [finished, doneId])
+  const headline = (doneId && cards[doneId] && cards[doneId].headline) || (s.done ? sentence(s.done.reason) : '')
   const failed = s.checks.filter(c => c.mandatory && (c.status === 'FAIL' || c.status === 'ERROR'))
   const passed = s.checks.filter(c => c.status === 'PASS')
   return jsx(Panel, {
@@ -1194,7 +1201,7 @@ function ChecksPanel({ s, finished }) {
                   style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' },
                   children: [jsx(VerdictLabel, { verdict: s.done.verdict }), jsx(Mono, { children: `at ${at(s.done.t)}` })]
                 }),
-                jsx('span', { style: { font: `13px/1.5 ${SANS}`, color: FG }, children: sentence(s.done.reason) }),
+                jsx('span', { style: { font: `13px/1.5 ${SANS}`, color: FG }, children: headline }),
                 finished
                   ? jsx('div', {
                       children: jsx(Button, {

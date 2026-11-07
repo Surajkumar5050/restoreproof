@@ -10,7 +10,7 @@
 <p align="center">
   <a href="#quick-start">Quick start</a> &nbsp;·&nbsp;
   <a href="#how-a-drill-works">How it works</a> &nbsp;·&nbsp;
-  <a href="#what-you-get">What you get</a> &nbsp;·&nbsp;
+  <a href="#what-you-get">Live view</a> &nbsp;·&nbsp;
   <a href="#the-recovery-contract">Recovery Contract</a> &nbsp;·&nbsp;
   <a href="#safety">Safety</a>
 </p>
@@ -82,6 +82,16 @@ Each stage either produces evidence or stops the claim. The result is one of fiv
 A skipped check never counts as passed, and BLOCKED or INCONCLUSIVE is never shown as PASS.
 
 ## What you get
+
+**A live view of the drill** in Hermes Desktop. It opens on its own when a drill starts and shows what
+happens behind each check: the isolated network, the database, app and probe containers starting and
+being removed, the restore counters, one square per file the database points to, and every request the
+probe sends. Nothing in it is simulated: every frame comes from the drill's own event log, so the same
+view replays any past run exactly.
+
+<p align="center">
+  <img src="assets/screens/live-drill.gif" width="88%" alt="The live drill view replaying a real drill: containers start in an isolated network, 1,149 files are restored and checksummed, the probe gets 200 for the invoice and 404 for its PDF, 55 of 1,204 referenced files show as a red run, the containers are removed, and the verdict is PARTIAL.">
+</p>
 
 **An evidence report** you can forward to whoever asks “are we covered?”. One file, fonts embedded, no
 network requests; it reads the same offline and on paper. Every file the database points to is drawn as
