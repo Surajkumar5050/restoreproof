@@ -1,0 +1,10 @@
+{
+  "name": "restoreproof",
+  "label": "RestoreProof",
+  "description": "Recovery drill history, live drill status and evidence reports for the RestoreProof Desktop pane.",
+  "icon": "Shield",
+  "version": "0.1.0",
+  "tab": { "path": "/restoreproof", "hidden": true },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

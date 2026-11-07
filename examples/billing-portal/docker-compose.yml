@@ -1,0 +1,30 @@
+# The "production" shape of the Billing Portal. RestoreProof never runs this
+# file: it reads it to learn which volumes hold state, then rebuilds the stack
+# from backups in its own isolated network.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: billing
+      POSTGRES_USER: billing
+      POSTGRES_PASSWORD: ${BILLING_DB_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  web:
+    image: restoreproof-demo/billing-portal:1.0
+    build: ./app
+    depends_on: [db]
+    environment:
+      DATABASE_URL: postgresql://billing:${BILLING_DB_PASSWORD}@db:5432/billing
+      UPLOAD_DIR: /data/uploads
+    ports:
+      - "8080:8080"
+    volumes:
+      - uploads:/data/uploads
+      - exports:/data/exports
+
+volumes:
+  pgdata:
+  uploads:
+  exports:
