@@ -82,7 +82,9 @@ class Drill:
 
     # -- events and state -----------------------------------------------------------------------------
 
-    def emit(self, kind: str, **data: Any) -> None:
+    def emit(self, kind: str, *, _state: bool = True, **data: Any) -> None:
+        """Append one event to events.jsonl. Progress events pass _state=False so frequent ticks do not
+        rewrite state.json each time."""
         event = {"ts": iso(utcnow()), "t": round(self.clock.elapsed(), 3), "run_id": self.run_id,
                  "kind": kind, **data}
         try:
@@ -90,7 +92,8 @@ class Drill:
                 fh.write(json.dumps(event, default=str) + "\n")
         except OSError:
             pass
-        self._write_state()
+        if _state:
+            self._write_state()
         if self.on_event:
             try:
                 self.on_event(event)
@@ -138,6 +141,56 @@ class Drill:
                                                        "kind", "duration")})
         return chk
 
+    # -- live view events -----------------------------------------------------------------------------
+    # Additive, for the Desktop live drill view: what the drill is doing behind each check. They never
+    # feed the verdict, and every value is a fact the engine just observed.
+
+    def resource(self, action: str, rtype: str, role: str, name: str, image: str | None = None) -> None:
+        """action: created | started | removed. rtype: network | container | volume | scratch."""
+        self.emit("resource", action=action, type=rtype, role=role, name=name,
+                  **({"image": image} if image else {}))
+
+    def file_progress(self, name: str, unit: str = "files"):
+        """A throttled counter: about 40 events per archive, plus the last file. unit is "files" while
+        extracting and "checksummed" while hashing the restored files."""
+        last = {"n": 0}
+
+        def tick(done: int, total: int) -> None:
+            step = max(1, total // 40)
+            if done == total or done - last["n"] >= step:
+                last["n"] = done
+                self.emit("progress", _state=False, what=name, unit=unit, done=done, total=total)
+        return tick
+
+    def journey_line(self, check: str, total: int):
+        """Turn the probe's streamed lines into journey events while the request is in flight."""
+        def on_line(line: str) -> None:
+            line = line.strip()
+            if not line.startswith("{"):
+                return
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                return
+            if "request" in msg:
+                r = msg["request"]
+                self.emit("journey", _state=False, phase="request", check=check, index=r.get("index"),
+                          total=total, method=r.get("method"), path=self.redact(str(r.get("path"))))
+            elif "response" in msg:
+                r = msg["response"]
+                self.emit("journey", _state=False, phase="response", check=check, index=r.get("index"),
+                          total=total, status=r.get("status"), elapsed=r.get("elapsed"), ok=bool(r.get("ok")),
+                          bytes=r.get("bytes"), content_type=(r.get("content_type") or "").split(";")[0],
+                          failed=[self.redact(str(f)) for f in r.get("failed") or []],
+                          **({"error": self.redact(str(r["error"]))} if r.get("error") else {}))
+        return on_line
+
+    def cleanup_removed(self, kind: str, names: list[str]) -> None:
+        rtype = {"containers": "container", "networks": "network", "volumes": "volume"}.get(kind, kind)
+        roles = {self.db_name: "database", self.app_name: "app", self.probe_name: "probe", self.net: "network"}
+        for name in names:
+            self.resource("removed", rtype, roles.get(name, rtype), name)
+
     # -- helpers --------------------------------------------------------------------------------------
 
     def dk(self, args: list[str], timeout: float = 120, **kw):
@@ -167,13 +220,19 @@ class Drill:
             pass
         return path
 
-    def probe(self, job: dict, timeout: float):
-        r = self.dk(["exec", "-i", self.probe_name, "python", "-c", PROBE_SOURCE],
-                    stdin=(json.dumps(job) + "\n").encode(), timeout=timeout)
+    def probe(self, job: dict, timeout: float, on_line: Callable[[str], None] | None = None):
+        args = ["exec", "-i", self.probe_name, "python", "-c", PROBE_SOURCE]
+        if on_line is not None:
+            # Same probe, same single call; it also prints each request and response as it happens.
+            r = self.docker.stream(args, stdin=(json.dumps({**job, "stream": True}) + "\n").encode(),
+                                   timeout=timeout, on_line=on_line)
+        else:
+            r = self.dk(args, stdin=(json.dumps(job) + "\n").encode(), timeout=timeout)
         if not r.ok:
             return None, self.redact(r.err.strip() or r.out.strip())
+        lines = [line for line in r.out.splitlines() if line.strip()]
         try:
-            return json.loads(r.out), None
+            return json.loads(lines[-1] if lines else r.out), None
         except json.JSONDecodeError:
             return None, "probe returned unreadable output: " + self.redact(r.out[:300])
 
@@ -266,6 +325,7 @@ class Drill:
             self.failed_artifacts.add(name)
             self.record("PREFLIGHT", f"{name} artifact exists", FAIL, f"missing from the backup set: {path.name}",
                         kind="artifact", evidence={"path": str(path)})
+            self.emit("artifact", name=name, file=path.name, present=False)
             return
         digest = sha256_file(path)
         size = path.stat().st_size
@@ -282,6 +342,8 @@ class Drill:
             self.record("PREFLIGHT", f"{name} artifact is present and intact", PASS,
                         f"{path.name}, {size:,} bytes, sha256 {digest[:12]}..., {note}", kind="artifact",
                         evidence=art)
+        self.emit("artifact", name=name, file=path.name, present=True, bytes=size, sha256=digest[:12],
+                  digest=("unrecorded" if not expected else "match" if expected.lower() == digest else "mismatch"))
 
     def _db_artifact_integrity(self, path: Path) -> None:
         if not path.is_file():
@@ -316,6 +378,7 @@ class Drill:
         r = self.dk(["network", "create", "--internal", *self.labels(), self.net], timeout=60)
         if not r.ok:
             raise RuntimeError("could not create the isolated network: " + r.err.strip())
+        self.resource("created", "network", "network", self.net)
         self.record("PROVISIONING", "isolated network created (internal, no internet egress)", PASS,
                     f"docker network {self.net} --internal", started=started,
                     evidence={"network": self.net, "internal": True})
@@ -337,6 +400,7 @@ class Drill:
             self.record("RESTORING", "temporary database started", FAIL, self.redact(r.err.strip()[:400]),
                         kind="data", started=started)
             return False
+        self.resource("started", "container", "database", self.db_name, db["image"])
         ready = False
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
@@ -383,6 +447,7 @@ class Drill:
             c = self.psql(f'select count(*) from public."{t}"')
             counts[t] = int(c.out.strip()) if c.ok and c.out.strip().isdigit() else None
         total = sum(v for v in counts.values() if v)
+        self.emit("restored", what="database", tables=len(counts), rows=total)
         self.record("RESTORING", "database restored from backup", PASS,
                     f"{len(counts)} tables, {total:,} rows restored into a fresh PostgreSQL",
                     kind="data", started=started, evidence={"tables": counts, "image": db["image"]})
@@ -400,7 +465,8 @@ class Drill:
                 continue
             dest = self.scratch / f["name"]
             try:
-                manifest = archive.extract(path, dest)
+                manifest = archive.extract(path, dest, progress=self.file_progress(f["name"]),
+                                           hashed=self.file_progress(f["name"], "checksummed"))
             except Exception as exc:
                 self.record("RESTORING", f"{f['name']} restored", FAIL, f"extraction failed: {exc}",
                             kind="files", started=started)
@@ -427,6 +493,7 @@ class Drill:
             self.record("STARTING", "application container created", FAIL, self.redact(r.err.strip()[:400]),
                         kind="service", started=started)
             return False
+        self.resource("created", "container", "app", self.app_name, svc["image"])
         for f in self.d["files"]:
             if f["name"] in self.manifests:
                 cp = self.dk(["cp", str(self.scratch / f["name"]) + "/.", f"{self.app_name}:{f['mount']}"],
@@ -440,11 +507,13 @@ class Drill:
             self.record("STARTING", "application started", FAIL, self.redact(r.err.strip()[:400]),
                         kind="service", started=started)
             return False
+        self.resource("started", "container", "app", self.app_name, svc["image"])
         r = self.dk(["run", "-d", "--name", self.probe_name, "--network", self.net, *self.labels(),
                      "--memory", "128m", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
                      PROBE_IMAGE, "sleep", str(int(self.d["limits"]["timeout"]) + 60)], timeout=60)
         if not r.ok:
             raise RuntimeError("could not start the journey probe: " + r.err.strip()[:300])
+        self.resource("started", "container", "probe", self.probe_name, PROBE_IMAGE)
         base = f"http://{self.app_name}:{svc['port']}"
         result, err = self.probe({"mode": "health", "base": base, "path": svc["health"],
                                   "timeout": self.d["limits"]["readiness_timeout"]},
@@ -531,6 +600,10 @@ class Drill:
                            f"backup; {where}")
             else:
                 summary = f"all {len(rows):,} files the database points to came back"
+            self.emit("references", check=chk["name"], total=len(rows), missing=len(missing),
+                      missing_runs=runs[:200], truncated=len(runs) > 200,
+                      first_path=self.redact(ordered[0][0]) if ordered else None,
+                      last_path=self.redact(ordered[-1][0]) if ordered else None)
             self.record("VALIDATING", chk["name"], FAIL if missing else PASS, summary, kind="reference",
                         mandatory=chk["mandatory"], started=started, evidence=evidence)
 
@@ -542,7 +615,8 @@ class Drill:
                             kind="journey", mandatory=j["mandatory"])
                 continue
             result, err = self.probe({"mode": "journey", "base": base, "steps": j["steps"], "step_timeout": 15},
-                                     timeout=60 + 20 * len(j["steps"]))
+                                     timeout=60 + 20 * len(j["steps"]),
+                                     on_line=self.journey_line(j["name"], len(j["steps"])))
             if result is None:
                 self.record("VALIDATING", j["name"], ERROR, f"probe failed: {err}", kind="journey",
                             mandatory=j["mandatory"], started=started)
@@ -675,10 +749,15 @@ class Drill:
         verdict, reason = self.verdict(blocked, inconclusive)
 
         self.stage_safe("CLEANING")
-        cleanup = self.docker.cleanup(self.run_id) if self.docker.binary else {"ok": True, "removed": 0,
-                                                                                "residual": {}, "errors": []}
+        cleanup = (self.docker.cleanup(self.run_id, on_removed=self.cleanup_removed) if self.docker.binary
+                   else {"ok": True, "removed": 0, "residual": {}, "errors": []})
+        had_scratch = self.scratch.exists()
         shutil.rmtree(self.scratch, ignore_errors=True)
         cleanup["scratch_removed"] = not self.scratch.exists()
+        if had_scratch and cleanup["scratch_removed"]:
+            self.resource("removed", "scratch", "files", "restored files")
+        self.emit("cleanup", ok=bool(cleanup.get("ok")), removed=cleanup.get("removed", 0),
+                  residual=cleanup.get("residual") or {})
         if self.stages and "ended" not in self.stages[-1]:
             self.stages[-1]["ended"] = round(self.clock.elapsed(), 3)
 

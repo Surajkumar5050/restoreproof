@@ -10,9 +10,10 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 LABEL = "restoreproof.run"
 
@@ -106,22 +107,95 @@ class Docker:
             found[kind] = [line for line in r.out.split() if line] if r.ok else []
         return found
 
-    def cleanup(self, run_id: str | None = None) -> dict:
-        """Remove every labelled resource, then look again to prove nothing is left."""
+    def stream(self, args: Sequence[str], *, stdin: bytes, timeout: float,
+               on_line: Callable[[str], None]) -> Result:
+        """Like run(), but hands each stdout line to on_line as it arrives (for live progress).
+
+        The full output is still returned, so callers parse the same result either way."""
+        if not self.binary:
+            return Result(127, "", "docker CLI not found")
+        try:
+            proc = subprocess.Popen([self.binary, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+        except OSError as exc:
+            return Result(126, "", f"could not run docker: {exc}")
+        out: list[bytes] = []
+        err: list[bytes] = []
+
+        def read_out() -> None:
+            for raw in iter(proc.stdout.readline, b""):
+                out.append(raw)
+                try:
+                    on_line(raw.decode("utf-8", "replace"))
+                except Exception:
+                    pass
+
+        def read_err() -> None:
+            err.append(proc.stderr.read())
+
+        readers = [threading.Thread(target=read_out, daemon=True), threading.Thread(target=read_err, daemon=True)]
+        for t in readers:
+            t.start()
+        try:
+            proc.stdin.write(stdin)
+            proc.stdin.close()
+        except OSError:
+            pass
+        def finish() -> None:
+            for t in readers:
+                t.join(timeout=5)
+            for pipe in (proc.stdout, proc.stderr):
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            finish()
+            return Result(124, b"".join(out).decode("utf-8", "replace"),
+                          f"docker {args[0] if args else ''} timed out after {timeout:.0f}s")
+        finish()
+        return Result(proc.returncode, b"".join(out).decode("utf-8", "replace"),
+                      b"".join(err).decode("utf-8", "replace"))
+
+    def cleanup(self, run_id: str | None = None,
+                on_removed: Callable[[str, list[str]], None] | None = None) -> dict:
+        """Remove every labelled resource, then look again to prove nothing is left.
+
+        on_removed(kind, names) is called after each removal command succeeds (for live progress);
+        the returned record, built from the second listing, stays the proof."""
         before = self.resources(run_id)
         errors: list[str] = []
+
+        def removed(kind: str, names: list[str]) -> None:
+            if on_removed is not None:
+                try:
+                    on_removed(kind, names)
+                except Exception:
+                    pass
+
         if before["containers"]:
             r = self.run(["rm", "-f", "-v", *before["containers"]], timeout=120)
             if not r.ok:
                 errors.append(r.err.strip()[:300])
+            else:
+                removed("containers", before["containers"])
         for net in before["networks"]:
             r = self.run(["network", "rm", net], timeout=60)
             if not r.ok:
                 errors.append(r.err.strip()[:300])
+            else:
+                removed("networks", [net])
         if before["volumes"]:
             r = self.run(["volume", "rm", "-f", *before["volumes"]], timeout=60)
             if not r.ok:
                 errors.append(r.err.strip()[:300])
+            else:
+                removed("volumes", before["volumes"])
         after = self.resources(run_id)
         removed = sum(len(v) for v in before.values()) - sum(len(v) for v in after.values())
         return {

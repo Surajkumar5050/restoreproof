@@ -12,6 +12,7 @@ import posixpath
 import tarfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 MAX_RATIO = 200  # uncompressed bytes per archive byte before we call it a bomb
 
@@ -72,18 +73,38 @@ def inspect(path: Path, *, max_bytes: int, max_members: int) -> ArchiveReport:
     return report
 
 
-def extract(path: Path, dest: Path) -> dict[str, dict]:
-    """Extract into an empty directory and return {relative path: {sha256, bytes}}."""
+def _tell(callback: Callable[[int, int], None] | None, done: int, total: int) -> None:
+    if callback is not None:
+        try:
+            callback(done, total)
+        except Exception:
+            pass
+
+
+def extract(path: Path, dest: Path, progress: Callable[[int, int], None] | None = None,
+            hashed: Callable[[int, int], None] | None = None) -> dict[str, dict]:
+    """Extract into an empty directory and return {relative path: {sha256, bytes}}.
+
+    progress(done, total) is called after each regular file is written and hashed(done, total) after
+    each one is checksummed, so a caller can show real counters. Both must be cheap; errors they raise
+    are ignored."""
     dest.mkdir(parents=True, exist_ok=True)
     if any(dest.iterdir()):
         raise RuntimeError(f"extraction target is not empty: {dest}")
     with tarfile.open(path, "r:*") as tar:
         members = [m for m in tar.getmembers() if _member_problem(m) is None]
-        tar.extractall(dest, members=members, filter="data")
+        total = sum(1 for m in members if m.isfile())
+        done = 0
+        for m in members:
+            tar.extract(m, dest, filter="data")
+            if m.isfile():
+                done += 1
+                _tell(progress, done, total)
+    files = [f for f in dest.rglob("*") if f.is_file()]
     manifest: dict[str, dict] = {}
-    for f in dest.rglob("*"):
-        if f.is_file():
-            rel = f.relative_to(dest).as_posix()
-            h = hashlib.sha256(f.read_bytes()).hexdigest()
-            manifest[rel] = {"sha256": h, "bytes": f.stat().st_size}
+    for i, f in enumerate(files, 1):
+        rel = f.relative_to(dest).as_posix()
+        h = hashlib.sha256(f.read_bytes()).hexdigest()
+        manifest[rel] = {"sha256": h, "bytes": f.stat().st_size}
+        _tell(hashed, i, len(files))
     return manifest

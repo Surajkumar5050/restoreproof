@@ -1,8 +1,11 @@
 """Journey probe: runs INSIDE the drill's isolated network, in a throwaway
 python:alpine container, so the restored app is never published to the host.
 
-It reads a JSON job on stdin and prints one JSON result on stdout. Standard
-library only. The engine sends this file's source as the program to run.
+It reads a JSON job on stdin and prints one JSON result on stdout. With
+"stream": true a journey also prints one line per request as it is sent and one
+per response as it arrives, before the result line, so the engine can show them
+live. Standard library only. The engine sends this file's source as the program
+to run.
 """
 
 import hashlib
@@ -75,17 +78,32 @@ def health(job):
     return {"ok": False, "attempts": attempts, "error": last}
 
 
+def announce(job, kind, payload):
+    if job.get("stream"):
+        sys.stdout.write(json.dumps({kind: payload}) + "\n")
+        sys.stdout.flush()
+
+
+def answered(job, index, rec):
+    announce(job, "response", {
+        "index": index, "status": rec.get("status"), "elapsed": rec.get("elapsed"), "ok": rec.get("ok"),
+        "bytes": rec.get("bytes"), "content_type": rec.get("content_type", ""), "error": rec.get("error"),
+        "failed": [c["check"] for c in rec.get("checks", []) if not c["ok"]]})
+
+
 def journey(job):
     variables, steps = {}, []
-    for step in job["steps"]:
+    for index, step in enumerate(job["steps"]):
         path = fill(step["path"], variables)
         rec = {"name": step["name"], "method": step["method"], "path": path, "checks": []}
         steps.append(rec)
+        announce(job, "request", {"index": index, "method": step["method"], "path": path})
         try:
             status, headers, raw, elapsed = fetch(job["base"], step["method"], path, step.get("headers"),
                                                   step.get("json"), job.get("step_timeout", 10))
         except Exception as exc:
             rec.update(ok=False, error=f"{type(exc).__name__}: {exc}")
+            answered(job, index, rec)
             return {"ok": False, "steps": steps}
         rec.update(status=status, elapsed=round(elapsed, 3), bytes=len(raw),
                    sha256=hashlib.sha256(raw).hexdigest(),
@@ -119,6 +137,7 @@ def journey(job):
             if value is not None:
                 variables[var] = value
         rec["ok"] = all(c["ok"] for c in rec["checks"])
+        answered(job, index, rec)
         if not rec["ok"]:
             return {"ok": False, "steps": steps}
     return {"ok": True, "steps": steps}

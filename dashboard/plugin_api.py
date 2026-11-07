@@ -84,6 +84,33 @@ def run(run_id: str):
     return report.card(ev)
 
 
+@router.get("/runs/{run_id}/events")
+def events(run_id: str, since: int = 0):
+    """The drill's own event log (events.jsonl), from line `since` on, for the live and replay view.
+
+    Read-only and incremental: a live view asks for the lines it has not seen yet. `finished` is true
+    once evidence.json exists, so the view knows no more events will come."""
+    if not RUN_ID.match(run_id):
+        raise HTTPException(status_code=400, detail="invalid run id")
+    run_dir = _home() / "runs" / run_id
+    log = run_dir / "events.jsonl"
+    if not run_dir.is_dir():
+        raise HTTPException(status_code=404, detail="no such run")
+    out: list[dict] = []
+    total = 0
+    if log.is_file():
+        lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+        total = len(lines)
+        for line in lines[max(0, since):max(0, since) + 2000]:
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                break  # the last line is still being written; it is sent on the next request
+    nxt = max(0, since) + len(out)
+    return {"run_id": run_id, "events": out, "next": nxt, "total": total,
+            "finished": (run_dir / "evidence.json").is_file() and nxt >= total}
+
+
 @router.get("/runs/{run_id}/report")
 def report_html(run_id: str):
     _, store = _engine()
