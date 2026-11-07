@@ -38,7 +38,9 @@ replace them with ad-hoc shell commands, and never decide a verdict yourself.
 
 ## 5. Keep it proven
 - Offer the "Nightly recovery drill" automation blueprint (`/blueprint`) so a broken backup is caught
-  the next morning, not during an outage. CI can run `hermes restoreproof run restoreproof.yaml`
+  the next morning, not during an outage. Unattended runs need a standing approval: tell the user to run
+  the drill once interactively and answer "always". That approval covers only this contract's exact
+  hash; editing the contract requires approving again. CI can run `hermes restoreproof run restoreproof.yaml`
   (exit 0 PASS, 1 PARTIAL/FAIL, 2 BLOCKED/INCONCLUSIVE).
 
 ## Honest limits to state when relevant
