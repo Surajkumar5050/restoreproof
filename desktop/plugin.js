@@ -1311,8 +1311,17 @@ function DrillView({ runId, live }) {
     if (!running) return undefined
     return ctxRef.setInterval(() => setNow(n => n + 1), 500)
   }, [running])
-  if (error && !events.length)
-    return jsx('div', { style: { padding: 20, color: FAIL, font: `13px/1.5 ${SANS}` }, children: `Could not load the drill’s events: ${error}` })
+  if (error && !events.length) {
+    // A routing 404 ({"detail":"Not Found"}) means this Desktop half is newer than the running
+    // backend; "no such run" is a real missing run. Say which, in words.
+    const stale = /Not Found/.test(String(error)) && !/no such run/.test(String(error))
+    const text = stale
+      ? 'RestoreProof was updated but Hermes is still running the previous version. Restart Hermes to finish the update, then replay this drill.'
+      : /no such run/.test(String(error))
+        ? 'This drill is not on this Hermes host.'
+        : `Could not load the drill’s events: ${error}`
+    return jsx('div', { style: { padding: 20, color: stale ? MUTED : FAIL, font: `13px/1.5 ${SANS}` }, children: text })
+  }
   if (!loaded) return jsx('div', { style: { padding: 20 }, children: jsx(GlyphSpinner, { ariaLabel: 'Loading drill' }) })
   // While live: the newest event's own drill time plus the time since it arrived. Both come from
   // this machine's clock and the engine's stopwatch, so a remote gateway's clock skew cannot show.

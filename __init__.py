@@ -14,7 +14,7 @@ from pathlib import Path
 from . import schemas
 from .engine import store
 from .engine.contract import ContractError, load_contract
-from .engine.report import summary_text
+from .engine.report import phone_text, summary_text
 from .tools import Tools, home_dir, lookup_secrets
 
 log = logging.getLogger("restoreproof")
@@ -50,7 +50,8 @@ def register(ctx) -> None:
             "action": "approve",
             "message": (f"RestoreProof will restore '{contract.name}' from {rp} into an isolated Docker network "
                         f"(4 temporary containers, no internet egress), run {n} mandatory checks, then delete "
-                        f"everything it created. Contract sha256 {contract.digest[:12]}."),
+                        f"everything it created. Contract sha256 {contract.digest[:12]}. Approving 'always' lets "
+                        f"this exact contract run unattended (nightly drills); editing it asks again."),
             "rule_key": f"restoreproof:{contract.name}:{contract.digest[:16]}",
         }
 
@@ -102,8 +103,13 @@ def register(ctx) -> None:
         log.debug("automation blueprints unavailable", exc_info=True)
 
 
+LOCAL_SURFACES = ("cli", "tui", "desktop", "acp")
+
+
 def drill_command(tools: Tools, raw: str) -> str:
     parts = (raw or "").split()
+    # Chat apps get the phone-sized message; a local report path means nothing on a phone.
+    on_phone = tools.surface() not in LOCAL_SURFACES
     sub = parts[0].lower() if parts else "status"
     home = home_dir()
     if sub == "run":
@@ -119,6 +125,8 @@ def drill_command(tools: Tools, raw: str) -> str:
         if "error" in result:
             return "RestoreProof: " + result["error"] + ("\n- " + "\n- ".join(result["problems"])
                                                         if result.get("problems") else "")
+        if on_phone:
+            return result["phone_text"]
         return result["summary_text"] + f"\nReport: {result['report_html']}"
     if sub == "history":
         rows = store.history(home, limit=10)
@@ -130,5 +138,7 @@ def drill_command(tools: Tools, raw: str) -> str:
         ev = store.load_evidence(home, parts[1] if len(parts) > 1 else "latest")
         if not ev:
             return "No drills yet. Try: /drill run restoreproof.yaml"
+        if on_phone:
+            return phone_text(ev)
         return summary_text(ev) + f"\nReport: {ev['reports']['html']}"
     return "Usage: /drill run <contract> [backup dir] | /drill status | /drill history | /drill report [run id]"

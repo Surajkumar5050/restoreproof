@@ -175,6 +175,7 @@ class Tools:
         rows = store.history(home_dir(), app=args.get("app"), limit=int(args.get("limit") or 10))
         for r in rows:
             r["recovery_time"] = human_duration(r.get("recovery_seconds"))
+            r["rpo"] = human_duration(r.get("rpo_seconds"))
         return _ok({"runs": rows})
 
     def cleanup(self, args: dict, **kwargs) -> str:

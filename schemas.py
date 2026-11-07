@@ -12,7 +12,8 @@ DISCOVER = {
     "description": (
         "Read a Docker Compose project and its backup folder (read-only, starts nothing). Returns a backup "
         "coverage map (which volumes no backup holds), database columns that reference files, and a DRAFT "
-        "Recovery Contract. Use it first when the user asks to set up or prove recovery for an app. Show the "
+        "Recovery Contract. Use it first when the user asks to set up or prove recovery for an app (workflow "
+        "guide: skill_view('restoreproof:restoreproof')). Show the "
         "user the coverage lines and the draft; ask them which customer journey proves the app works before "
         "saving a contract. Never invent journeys silently."),
     "parameters": {"type": "object", "properties": {
@@ -40,7 +41,8 @@ RUN = {
         "contract check (data, file references, user journeys), measure recovery time and RPO, clean up and "
         "write an evidence report. Requires human approval bound to the contract's hash. Takes ~20-120s. "
         "The verdict (PASS, PARTIAL, FAIL, BLOCKED, INCONCLUSIVE) comes from the engine: report it exactly, "
-        "never upgrade it. Explain failures from the evidence, separating facts from hypotheses."),
+        "never upgrade it. Explain failures from the evidence, separating facts from hypotheses. Workflow "
+        "guide: skill_view('restoreproof:restoreproof')."),
     "parameters": {"type": "object", "properties": {"contract_path": CONTRACT, "recovery_point": RECOVERY_POINT},
                    "required": ["contract_path"]},
 }

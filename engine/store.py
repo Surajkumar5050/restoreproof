@@ -57,7 +57,8 @@ def history(home: Path, app: str | None = None, limit: int = 20) -> list[dict]:
             "reason": ev["verdict_reason"], "started_at": ev["started_at"],
             "recovery_point": (ev.get("recovery_point") or {}).get("label"),
             "recovery_seconds": o.get("measured_recovery_seconds"), "rpo_seconds": o.get("rpo_seconds"),
-            "trigger": ev.get("trigger"), "report": (ev.get("reports") or {}).get("html"),
+            # Derived from the run folder, so runs saved by older versions still point at their report.
+            "trigger": ev.get("trigger"), "report": str(d / "report.html") if (d / "report.html").is_file() else None,
         })
         if len(out) >= limit:
             break
