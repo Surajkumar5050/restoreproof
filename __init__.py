@@ -36,24 +36,17 @@ def register(ctx) -> None:
                           description=schema["description"].split(".")[0], emoji=emoji)
 
     def approval_gate(tool_name, args, task_id="", **kwargs):
-        """Every drill needs a human yes. The yes is bound to the contract's sha256, so 'always allow'
-        survives nightly runs but a changed contract must be approved again."""
+        """Every drill needs a human yes. The yes covers what actually runs: this contract's sha256 AND
+        the backup folder it will read. 'Always allow' survives nightly runs of that pair; a changed
+        contract or a different backup folder asks again."""
         if tool_name != "restoreproof_run_drill":
             return None
         try:
             contract = load_contract(tools.resolve((args or {}).get("contract_path")))
         except (ContractError, TypeError, OSError):
             return None  # the tool reports the contract error itself; nothing runs
-        rp = (args or {}).get("recovery_point") or contract.data["recovery_point"].get("dir") or "."
-        n = len(contract.mandatory_checks())
-        return {
-            "action": "approve",
-            "message": (f"RestoreProof will restore '{contract.name}' from {rp} into an isolated Docker network "
-                        f"(4 temporary containers, no internet egress), run {n} mandatory checks, then delete "
-                        f"everything it created. Contract sha256 {contract.digest[:12]}. Approving 'always' lets "
-                        f"this exact contract run unattended (nightly drills); editing it asks again."),
-            "rule_key": f"restoreproof:{contract.name}:{contract.digest[:16]}",
-        }
+        rule_key, message = approval_request(contract, tools.resolve((args or {}).get("recovery_point")))
+        return {"action": "approve", "message": message, "rule_key": rule_key}
 
     ctx.register_hook("pre_tool_call", approval_gate)
 
@@ -101,6 +94,33 @@ def register(ctx) -> None:
         )
     except Exception:
         log.debug("automation blueprints unavailable", exc_info=True)
+
+
+def approval_request(contract, recovery_point) -> tuple[str, str]:
+    """The approval rule key and message for one drill.
+
+    The backup folder is resolved exactly as the drill resolves it, so the approval names, and is
+    bound to, the folder that will actually be read."""
+    import hashlib
+    import os
+
+    from .engine.runner import PROBE_IMAGE
+
+    folder = contract.recovery_dir(recovery_point).resolve()
+    folder_id = hashlib.sha256(os.path.normcase(str(folder)).encode("utf-8")).hexdigest()[:12]
+    d = contract.data
+    images = [d["database"]["image"], d["service"]["image"], PROBE_IMAGE]
+    secrets = d["service"]["secrets"]
+    message = (
+        f"RestoreProof will restore '{contract.name}' from {folder} into an isolated Docker network with no "
+        f"internet access, using images {', '.join(images)}. "
+        + (f"Secrets passed to the app container: {', '.join(secrets)} (names only; values never reach the model). "
+           if secrets else "No secrets are passed to any container. ")
+        + f"It runs {len(contract.mandatory_checks())} mandatory checks, then deletes everything it created. "
+        f"Contract sha256 {contract.digest[:12]}, backup folder {folder_id}. 'Always' covers exactly this "
+        f"contract and this backup folder; any other folder or an edited contract asks again."
+    )
+    return f"restoreproof:{contract.name}:{contract.digest[:16]}:{folder_id}", message
 
 
 LOCAL_SURFACES = ("cli", "tui", "desktop", "acp")

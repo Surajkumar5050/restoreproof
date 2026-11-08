@@ -15,7 +15,7 @@ from .engine.contract import ContractError, load_contract
 from .engine.docker import Docker
 from .engine.plan import preflight_plan
 from .engine.report import failed_mandatory, phone_text, short_finding, stage_states, summary_text
-from .engine.runner import Drill
+from .engine.runner import Drill, contained
 from .engine.util import data_home, human_duration
 
 log = logging.getLogger("restoreproof")
@@ -93,9 +93,18 @@ class Tools:
                 return _err(f"project folder not found: {project}")
             result = discover_mod.discover(project, backups=args.get("backups_dir"))
             draft_path = None
+            draft_note = None
             if args.get("write_draft"):
-                draft_path = project / "restoreproof.draft.yaml"
-                draft_path.write_text(result["contract_yaml"], encoding="utf-8")
+                # Only inside the session's working folder, and never over an existing file.
+                if contained(self.cwd(), project) is None:
+                    draft_note = (f"not written: {project} is outside the session's working folder "
+                                  f"{self.cwd()}; the draft is returned below instead")
+                elif (project / "restoreproof.draft.yaml").exists():
+                    draft_note = "not written: restoreproof.draft.yaml already exists and is never overwritten"
+                else:
+                    draft_path = project / "restoreproof.draft.yaml"
+                    with open(draft_path, "x", encoding="utf-8") as fh:  # "x" fails rather than overwrite
+                        fh.write(result["contract_yaml"])
             return _ok({
                 "coverage": result["coverage_lines"],
                 "uncovered_volumes": result["uncovered_volumes"],
@@ -103,6 +112,7 @@ class Tools:
                 "backup_sets": result["backup_sets"],
                 "draft_contract_yaml": result["contract_yaml"],
                 "draft_written_to": str(draft_path) if draft_path else None,
+                "draft_note": draft_note,
                 "next": "Show the coverage. Ask the user which customer journey proves the app works "
                         "(e.g. open a record and download its file), add it under checks.journeys, then "
                         "save as restoreproof.yaml and call restoreproof_plan.",
@@ -147,6 +157,8 @@ class Tools:
             _RUN_LOCK.release()
 
     def report(self, args: dict, **kwargs) -> str:
+        if not store.valid_run_ref(args.get("run_id")):
+            return _err("run_id must look like rp-20261107-081311-702f, or be 'latest' or 'previous'")
         ev = store.load_evidence(home_dir(), args.get("run_id") or "latest")
         if not ev:
             return _err("no such drill run", hint="call restoreproof_history to list runs")
@@ -165,6 +177,8 @@ class Tools:
 
     def compare(self, args: dict, **kwargs) -> str:
         home = home_dir()
+        if not (store.valid_run_ref(args.get("before")) and store.valid_run_ref(args.get("after"))):
+            return _err("before/after must be run ids like rp-20261107-081311-702f, or 'latest' / 'previous'")
         a = store.load_evidence(home, args.get("before") or "previous", app=args.get("app"))
         b = store.load_evidence(home, args.get("after") or "latest", app=args.get("app"))
         if not a or not b:
@@ -180,7 +194,10 @@ class Tools:
 
     def cleanup(self, args: dict, **kwargs) -> str:
         try:
-            return _ok(Docker().cleanup(args.get("run_id")))
+            run_id = args.get("run_id")
+            if run_id is not None and not store.RUN_ID.match(str(run_id)):
+                return _err("run_id must look like rp-20261107-081311-702f (omit it to clean every drill)")
+            return _ok(Docker().cleanup(run_id))
         except Exception as exc:
             return _err(f"cleanup failed: {exc}")
 

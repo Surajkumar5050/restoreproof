@@ -3,7 +3,16 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
+
+RUN_ID = re.compile(r"^rp-\d{8}-\d{6}-[0-9a-f]{4}$")
+RUN_REFS = ("latest", "previous", "last")
+
+
+def valid_run_ref(value: str | None) -> bool:
+    """A run id, a relative reference, or nothing (meaning the latest). Anything else could name a path."""
+    return value is None or value in RUN_REFS or bool(RUN_ID.match(str(value)))
 
 
 def runs_dir(home: Path) -> Path:
@@ -14,7 +23,9 @@ def runs_dir(home: Path) -> Path:
 
 def load_evidence(home: Path, run_id: str | None = None, app: str | None = None) -> dict | None:
     """Load one run's evidence. run_id may be 'latest', 'previous' or None (= latest)."""
-    if run_id and run_id not in ("latest", "previous", "last"):
+    if not valid_run_ref(run_id):
+        return None
+    if run_id and run_id not in RUN_REFS:
         run = runs_dir(home) / run_id
         path = run / "evidence.json"
         if not path.is_file():

@@ -8,6 +8,7 @@ call is an argument list, never a string built from user input.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import threading
@@ -16,6 +17,20 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 LABEL = "restoreproof.run"
+
+
+# The docker CLI gets only what it needs to find its engine and config, never Hermes' own environment
+# (which holds model-provider keys). The Windows entries locate system DLLs, the user profile and temp
+# folders; none of them carry credentials.
+DOCKER_ENV_KEYS = ("PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_CERT_PATH",
+                   "DOCKER_TLS_VERIFY", "XDG_RUNTIME_DIR")
+WINDOWS_ENV_KEYS = ("SYSTEMROOT", "WINDIR", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+                    "PROGRAMDATA", "PROGRAMFILES", "TEMP", "TMP", "PATHEXT", "COMSPEC")
+
+
+def docker_env() -> dict[str, str]:
+    keys = DOCKER_ENV_KEYS + (WINDOWS_ENV_KEYS if os.name == "nt" else ())
+    return {k: os.environ[k] for k in keys if os.environ.get(k)}
 
 
 class DockerError(RuntimeError):
@@ -66,9 +81,11 @@ class Docker:
         try:
             if stdin_file is not None:
                 with open(stdin_file, "rb") as fh:
-                    proc = subprocess.run([self.binary, *args], stdin=fh, capture_output=True, timeout=timeout)
+                    proc = subprocess.run([self.binary, *args], stdin=fh, capture_output=True, timeout=timeout,
+                                          env=docker_env())
             else:
-                proc = subprocess.run([self.binary, *args], input=stdin, capture_output=True, timeout=timeout)
+                proc = subprocess.run([self.binary, *args], input=stdin, capture_output=True, timeout=timeout,
+                                      env=docker_env())
         except subprocess.TimeoutExpired:
             return Result(124, "", f"docker {args[0] if args else ''} timed out after {timeout:.0f}s")
         except OSError as exc:
@@ -116,7 +133,7 @@ class Docker:
             return Result(127, "", "docker CLI not found")
         try:
             proc = subprocess.Popen([self.binary, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE)
+                                    stderr=subprocess.PIPE, env=docker_env())
         except OSError as exc:
             return Result(126, "", f"could not run docker: {exc}")
         out: list[bytes] = []

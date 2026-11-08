@@ -40,6 +40,16 @@ class DrillTimeout(Exception):
     pass
 
 
+def contained(base: Path, path: Path) -> Path | None:
+    """path resolved, or None if it resolves outside base (via '..', an absolute path or a link)."""
+    base_r, path_r = base.resolve(), path.resolve()
+    try:
+        path_r.relative_to(base_r)
+    except ValueError:
+        return None
+    return path_r
+
+
 def new_run_id() -> str:
     now = utcnow()
     return f"rp-{now:%Y%m%d-%H%M%S}-{pysecrets.token_hex(2)}"
@@ -268,7 +278,8 @@ class Drill:
             raise Blocked(f"recovery point directory not found: {self.recovery_dir}")
         claimed = None
         status_name = self.d["recovery_point"].get("status_file")
-        if status_name and (self.recovery_dir / status_name).is_file():
+        if (status_name and contained(self.recovery_dir, self.recovery_dir / status_name) is not None
+                and (self.recovery_dir / status_name).is_file()):
             try:
                 claimed = json.loads((self.recovery_dir / status_name).read_text(encoding="utf-8"))
             except (OSError, ValueError):
@@ -291,7 +302,7 @@ class Drill:
         for f in self.d["files"]:
             path = self.recovery_dir / f["artifact"]
             self._artifact_check(f["name"], path, f.get("sha256") or claimed_arts.get(f["artifact"], {}).get("sha256"), t)
-            if path.is_file():
+            if path.is_file() and contained(self.recovery_dir, path) is not None:
                 started = self.clock.elapsed()
                 rep = archive.inspect(path, max_bytes=self.d["limits"]["max_archive_bytes"],
                                       max_members=self.d["limits"]["max_archive_members"])
@@ -321,6 +332,14 @@ class Drill:
                     kind="artifact", evidence={"images": self.inputs["images"]})
 
     def _artifact_check(self, name: str, path: Path, expected: str | None, started: float) -> None:
+        if contained(self.recovery_dir, path) is None:
+            # A drill reads only the backup folder it was pointed at.
+            self.failed_artifacts.add(name)
+            self.record("PREFLIGHT", f"{name} artifact exists", FAIL,
+                        f"refused: {path.name} is outside the backup folder", kind="artifact",
+                        evidence={"path": str(path)})
+            self.emit("artifact", name=name, file=path.name, present=False)
+            return
         if not path.is_file():
             self.failed_artifacts.add(name)
             self.record("PREFLIGHT", f"{name} artifact exists", FAIL, f"missing from the backup set: {path.name}",
@@ -346,7 +365,7 @@ class Drill:
                   digest=("unrecorded" if not expected else "match" if expected.lower() == digest else "mismatch"))
 
     def _db_artifact_integrity(self, path: Path) -> None:
-        if not path.is_file():
+        if "database" in self.failed_artifacts or not path.is_file():
             return
         started = self.clock.elapsed()
         name = path.name.lower()
@@ -453,6 +472,10 @@ class Drill:
                     kind="data", started=started, evidence={"tables": counts, "image": db["image"]})
         return True
 
+    def scratch_dest(self, name: str) -> Path | None:
+        """Where a file group is extracted, or None if that would leave the scratch folder."""
+        return contained(self.scratch, self.scratch / name)
+
     def restore_files(self) -> bool:
         ok = True
         for f in self.d["files"]:
@@ -463,7 +486,13 @@ class Drill:
                             "not attempted: its artifact failed preflight", kind="files", started=started)
                 ok = False
                 continue
-            dest = self.scratch / f["name"]
+            dest = self.scratch_dest(f["name"])
+            if dest is None or dest == self.scratch.resolve():
+                self.record("RESTORING", f"{f['name']} restored", FAIL,
+                            "refused: its extraction folder would be outside the drill's scratch area",
+                            kind="files", started=started)
+                ok = False
+                continue
             try:
                 manifest = archive.extract(path, dest, progress=self.file_progress(f["name"]),
                                            hashed=self.file_progress(f["name"], "checksummed"))

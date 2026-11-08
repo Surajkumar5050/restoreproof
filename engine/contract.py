@@ -172,6 +172,10 @@ def normalise(raw: dict) -> tuple[dict, list[str], list[str]]:
         where = f"files[{i}]"
         f = _mapping(f, where, errors)
         fname = _str(f, "name", errors, where)
+        if fname and not NAME_RE.match(fname):
+            # The name becomes a folder under the drill's scratch area, so it must never carry a path.
+            errors.append(f"{where}.name must be lowercase letters, digits, '.', '_' or '-' (max 63), "
+                          "with no slashes or '..'")
         art = _str(f, "artifact", errors, where)
         mount = _str(f, "mount", errors, where)
         if fname and fname in seen:
