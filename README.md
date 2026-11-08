@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="assets/banner.jpg" width="100%" alt="RestoreProof, a community plugin for Hermes Agent. An engraved Hermes before a red sun, a drill transcript on the left and a blueprint of the drill on the right: the backup said success, the drill found PARTIAL.">
+  <img src="assets/banner.jpg" width="100%" alt="RestoreProof, a community plugin for Hermes Agent. A marble Hermes in pale halftone dots on electric blue, cut by thin glitch lines, beside the words Backups are claims. Drills are proof.">
 </p>
 
 <p align="center">
   <b>Your backup job says “success”. RestoreProof proves your app can actually come back.</b><br>
-  <sub>A Hermes Agent plugin · Docker · PostgreSQL · MIT</sub>
+  <sub>A Hermes Agent plugin · Docker · PostgreSQL, MySQL, MariaDB, MongoDB, SQLite · MIT</sub>
 </p>
 
 <p align="center">
@@ -45,19 +45,27 @@ hermes plugins install Surajkumar5050/restoreproof --enable
 Once it is listed in the Hermes catalog, `hermes plugins install restoreproof --enable` does the same.
 In Hermes Desktop, turn on its Desktop part in **Capabilities → Plugins**.
 
-**2. Set up the demo**, a billing portal whose “successful” backup is quietly broken
+**2. Run the demo**, a billing portal whose “successful” backup is quietly broken. In any Hermes chat:
 
-```bash
-python examples/billing-portal/setup_demo.py
+```text
+/drill demo
 ```
 
-**3. Run a drill**
+It builds the small demo app, writes two nights of backups and drills the broken one, in about a minute
+the first time. `/drill demo fixed` drills the good night. Add `mysql`, `mariadb`, `mongodb` or `sqlite`
+to run the same demo on that database. In Hermes Desktop the RestoreProof pane has a **Run the demo**
+button that does the same.
 
-```bash
-hermes restoreproof run examples/billing-portal/restoreproof.yaml
-```
+**3. Point it at your own app.** Tell Hermes in plain words, for example *“set up a RestoreProof drill
+for the app in ~/code/shop”*, or press **Set up my app** in the Desktop pane and pick the folder. Hermes
+finds the database dump and file archives, asks what a customer does, writes the contract, shows you the
+plan and runs the drill when you approve. `/drill help` says the same in a chat app.
 
-Or ask Hermes in plain words: *“prove billing-portal can come back from last night's backup.”*
+From a terminal or CI, the same drill is `hermes restoreproof run restoreproof.yaml`.
+
+<p align="center">
+  <img src="assets/screens/get-started.png" width="88%" alt="Hermes Desktop with the RestoreProof pane open on its first-run panel: Prove your app can come back, a Run the demo button, a Set up my app button, and what you need: Docker, a backup folder and your app's Docker image. Beside it, the evidence cards of two drills in the chat.">
+</p>
 
 <p align="center">
   <img src="assets/drill.svg" width="100%" alt="A real drill in the terminal: every stage passes until verify, where 55 invoice files are missing and INV-2152 returns 404. Verdict PARTIAL.">
@@ -83,19 +91,21 @@ A skipped check never counts as passed, and BLOCKED or INCONCLUSIVE is never sho
 
 ## What you get
 
-**A live view of the drill** in Hermes Desktop. It opens on its own when a drill starts and shows what
-happens behind each check: the isolated network, the database, app and probe containers starting and
-being removed, the restore counters, one square per file the database points to, and every request the
-probe sends. Nothing in it is simulated: every frame comes from the drill's own event log, so the same
-view replays any past run exactly.
+**A live view of the drill** in Hermes Desktop. It opens on its own when a drill starts and answers
+first: six plain steps, one sentence on what is happening now, and the sealed sandbox as three boxes
+(the restored database, your app, a test customer). When the drill ends it shows the verdict in words,
+the one-line finding and the one thing to fix. Backup files, checks, requests and the event log stay
+folded under **Technical details**. Nothing in it is simulated: every frame comes from the drill's own
+event log, so the same view replays any past run exactly.
 
 <p align="center">
   <img src="assets/screens/live-drill.gif" width="88%" alt="The live drill view replaying a real drill: containers start in an isolated network, 1,149 files are restored and checksummed, the probe gets 200 for the invoice and 404 for its PDF, 55 of 1,204 referenced files show as a red run, the containers are removed, and the verdict is PARTIAL.">
 </p>
 
-**An evidence report** you can forward to whoever asks “are we covered?”. One file, fonts embedded, no
-network requests; it reads the same offline and on paper. Every file the database points to is drawn as
-a square, so a missing folder shows up as one red run.
+**An evidence report** you can forward to whoever asks “are we covered?”. It opens with the answer
+(“Not fully recoverable”), one plain sentence, three numbers people ask about (how long recovery took,
+how much data you would lose, how many checks passed) and the one fix. The evidence behind each check is
+folded below. One file, fonts embedded, no network requests; it reads the same offline and on paper.
 
 <p align="center">
   <img src="assets/screens/report.jpg" width="88%" alt="The evidence report: verdict PARTIAL, the backup job's claim against the drill's finding, objectives, and a grid of every referenced file with the missing run in red.">
@@ -131,8 +141,8 @@ Report rp-20261107-094452-af01
 ## The Recovery Contract
 
 What “recovered” means for one app, in a file next to your `docker-compose.yml`. Every field maps to a
-fixed, validated operation. Nothing in it runs as a shell command, and SQL checks must be single
-read-only `SELECT` statements.
+fixed, validated operation. Nothing in it runs as a shell command. SQL checks must be single read-only
+`SELECT` statements, and MongoDB checks single expressions that only read.
 
 ```yaml
 restoreproof: 1
@@ -142,7 +152,7 @@ database: { engine: postgres, artifact: db.sql.gz, name: billing, user: billing 
 files:
   - { name: uploads, artifact: uploads.tar.gz, mount: /data/uploads }
 service:
-  image: restoreproof-demo/billing-portal:1.0
+  image: restoreproof-demo/billing-portal:1.1
   env: { DATABASE_URL: "postgresql://{db.user}:{db.password}@{db.host}:{db.port}/{db.name}" }
 checks:
   references:
@@ -156,6 +166,20 @@ checks:
         - { get: "{pdf_url}", expect_status: 200, expect_header: { content-type: application/pdf } }
 objectives: { rto: 10m, rpo: 24h, rpo_watermark_sql: select max(created_at) from invoices }
 ```
+
+### Databases
+
+| Engine | Backup it restores | Checks are written in |
+|---|---|---|
+| PostgreSQL | `.sql`, `.sql.gz`, pg_dump custom format (`.dump`) | SQL `SELECT` |
+| MySQL, MariaDB | `.sql`, `.sql.gz` from mysqldump or mariadb-dump | SQL `SELECT` |
+| MongoDB | `mongodump --archive`, optionally `--gzip` | a read-only mongosh expression, under `query:` |
+| SQLite | the database file (`.db`, `.sqlite`, optionally gzipped) | SQL `SELECT`; the file must pass SQLite's own integrity check |
+
+Each engine restores into its own throwaway container on the sealed network. For SQLite the restored
+file is also copied into your app at `database.mount`, the path it opens. The demo ships a contract for
+every engine (`examples/billing-portal/restoreproof.<engine>.yaml`), and all five pass the same drill
+in the test suite.
 
 You rarely write one from scratch. `restoreproof_discover` reads your compose file and backups and
 drafts it, with a **backup coverage map**: in the demo it finds on its own that the `exports` volume is
@@ -184,7 +208,8 @@ A tool that restores data and starts applications handles sensitive and possibly
 - **Reads** only the backup folder and contract you point it at.
 - **Writes** run evidence under Hermes's plugin data directory, and `restoreproof.draft.yaml` only when you
   ask discovery to.
-- **Network:** none of its own. No telemetry. Docker images must already be present locally.
+- **Network:** none of its own. No telemetry. A drill never pulls images. Only when you type
+  `/drill demo` does it build the demo app image and pull the database and probe images it needs.
 
 </details>
 
@@ -192,8 +217,10 @@ A tool that restores data and starts applications handles sensitive and possibly
 <summary><b>How it is tested</b></summary>
 <br>
 
-Unit tests cover contract validation, archive attacks, verdict logic and the report. Eight end-to-end
-scenarios run **real drills** against Docker and assert the verdict and that nothing is left behind:
+Unit tests cover contract validation for every engine, backup-format checks, discovery, archive
+attacks, verdict logic and the report. End-to-end tests run **real drills** against Docker and assert
+the verdict and that nothing is left behind. The same broken and fixed nights are drilled on PostgreSQL,
+MySQL, MariaDB, MongoDB and SQLite, and eight scenarios cover the failure paths:
 
 broken backup → PARTIAL with exactly 55 missing files · fixed backup → PASS with the same contract ·
 missing dump → FAIL · tampered archive → FAIL on its digest · path-traversal archive rejected before
@@ -210,9 +237,10 @@ python -m unittest discover -s tests -p "test_*.py"
 <summary><b>Limits</b></summary>
 <br>
 
-PostgreSQL dumps (`.sql`, `.sql.gz`, pg_dump custom format), tar archives and one application image per
-contract today. MySQL, S3-compatible object storage and multi-service graphs are next. RestoreProof
-complements your backup tool; it does not take backups.
+The five databases above, tar archives for files, and one application image per contract today.
+S3-compatible object storage and multi-service graphs are next. For SQLite, an app that runs as a
+non-root user gets the restored file read-only. RestoreProof complements your backup tool; it does not
+take backups.
 
 </details>
 
@@ -230,7 +258,7 @@ RestoreProof checks whether your app can make the same trip, before the day it h
 
 <sub>
 Art: <a href="https://www.metmuseum.org/art/collection/search/254925">Marble statue of Hermes</a>, 1st–2nd century CE,
-engraved by <code>scripts/build_readme_art.py</code>, and <a href="https://www.metmuseum.org/art/collection/search/252973">Terracotta bell-krater, the Return of Persephone</a>,
+screened by <code>scripts/build_halftone_art.py</code>, and <a href="https://www.metmuseum.org/art/collection/search/252973">Terracotta bell-krater, the Return of Persephone</a>,
 Persephone Painter, ca. 440 BCE. The Metropolitan Museum of Art, Open Access (CC0).
 Fonts: Courier Prime and JetBrains Mono, SIL Open Font License 1.1 (<code>licenses/</code>).
 RestoreProof is MIT licensed. It is an independent community plugin, not affiliated with Nous Research.

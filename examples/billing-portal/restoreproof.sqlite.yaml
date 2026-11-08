@@ -1,0 +1,69 @@
+# Recovery Contract: what "recovered" means for the Billing Portal on sqlite.
+# Backups: python make_backups.py backups-sqlite --engine sqlite
+# Read by RestoreProof, never executed as a script: every field maps to a fixed,
+# validated operation.
+restoreproof: 1
+
+app:
+  name: billing-portal
+  description: Customer billing portal (staging recovery profile)
+  owner: platform-team
+
+recovery_point:
+  label: nightly-2026-11-06
+  dir: backups-sqlite/nightly-2026-11-06
+  status_file: backup-status.json   # what the backup job claimed
+
+database:
+  engine: sqlite
+  artifact: db.sqlite
+  mount: /data/billing.db           # the file the app opens
+
+files:
+  - name: uploads
+    artifact: uploads.tar.gz
+    mount: /data/uploads
+    covers_volume: uploads
+
+service:
+  image: restoreproof-demo/billing-portal:1.1
+  port: 8080
+  health: /health
+  env:
+    DATABASE_URL: "sqlite:///{db.path}"
+    UPLOAD_DIR: /data/uploads
+
+checks:
+  data:
+    - name: customers came back
+      sql: select count(*) from customers
+      expect: {min: 1}
+    - name: every invoice belongs to a customer
+      sql: select count(*) from invoices i left join customers c on c.id = i.customer_id where c.id is null
+      expect: {equals: 0}
+  references:
+    - name: every invoice PDF referenced in the database exists
+      sql: select number, pdf_path from invoices where pdf_path is not null
+      files: uploads
+  journeys:
+    - name: a customer opens invoice INV-2152 and downloads the PDF
+      steps:
+        - get: /api/invoices/INV-2152
+          expect_status: 200
+          expect_json: {number: INV-2152}
+          capture: {pdf_url: $.pdf_url}
+        - get: "{pdf_url}"
+          expect_status: 200
+          expect_header: {content-type: application/pdf}
+          expect_body_prefix: "%PDF"
+
+objectives:
+  rto: 10m
+  rpo: 24h
+  rpo_watermark_sql: select max(created_at) from invoices
+  incident_time: "2026-11-07T08:00:00Z"   # rehearse an outage at this moment
+
+limits:
+  timeout: 15m
+  db_memory: 512m
+  app_memory: 256m

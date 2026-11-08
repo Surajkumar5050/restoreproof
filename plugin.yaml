@@ -2,15 +2,16 @@ manifest_version: 2
 name: restoreproof
 version: 0.1.0
 description: >-
-  Recovery drills for real application stacks. Restores a declared PostgreSQL dump and uploads archive
-  into an isolated Docker network, boots the app, and proves (or disproves) that customers' journeys
-  work: every database file reference, a real user flow, measured recovery time and RPO, then cleans
-  up and writes a hashed evidence report. Deterministic engine; the model never decides a verdict.
+  Recovery drills for real application stacks. Restores a declared database backup (PostgreSQL, MySQL,
+  MariaDB, MongoDB or SQLite) and uploads archive into an isolated Docker network, boots the app, and
+  proves (or disproves) that customers' journeys work: every database file reference, a real user flow,
+  measured recovery time and RPO, then cleans up and writes a hashed evidence report. Deterministic
+  engine; the model never decides a verdict.
 author: Suraj Kumar Sahoo
 license: MIT
 homepage: https://github.com/surajkumar5050/restoreproof
 requires_hermes: ">=0.23.0"
-tags: [backup, disaster-recovery, postgres, docker, devops, sre]
+tags: [backup, disaster-recovery, postgres, mysql, mongodb, sqlite, docker, devops, sre]
 provides_tools:
   - restoreproof_discover
   - restoreproof_plan

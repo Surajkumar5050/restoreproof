@@ -2,12 +2,15 @@
  * RestoreProof for Hermes Desktop.
  *
  *  - Pane: the drill running now (stage by stage) or the latest verdict, findings and history.
+ *    With no drills yet it shows how to start: run the demo, or pick the app's folder and get a
+ *    ready prompt in the composer. "New drill" brings the same choices back later.
  *  - Status bar chip: the last verdict at a glance.
  *  - Inline card: the model writes ::restoreproof{run="rp-..."} and the evidence renders in chat.
  *  - Report tab: the full case-file report, sandboxed, inside Hermes.
- *  - Drill view: a workspace tab that opens by itself when a drill starts and shows what it does
- *    behind the scenes (artifacts, the isolated network, containers, file counters, the reference
- *    grid, probe requests, cleanup, verdict, event log). The same renderer replays finished runs.
+ *  - Drill view: a workspace tab that opens by itself when a drill starts. It answers first: six
+ *    plain steps, one sentence on what is happening now, the sandbox as three boxes (database, your
+ *    app, a test customer), then the verdict and the one fix. Backup files, checks, requests and the
+ *    event log stay folded under "Technical details". The same renderer replays finished runs.
  *    Every state in it is derived from the drill's own events.jsonl; nothing is simulated.
  *  - Pet line + OS notification when a drill you are watching finishes.
  *
@@ -486,13 +489,114 @@ function History({ runs, selected }) {
   })
 }
 
-function Empty() {
-  return jsxs('div', {
-    style: { display: 'flex', flexDirection: 'column', gap: 8, padding: '8px 2px', font: `13px/1.55 ${SANS}`, color: MUTED },
+// -- getting started --------------------------------------------------------------------------------
+//
+// Two ways in, both ending in the chat so the user sees and sends every request themselves:
+//   Run the demo   sends /drill demo (the user's click is the request; the drill view opens by itself)
+//   Set up my app  asks for the app's folder with Desktop's own picker, then writes a plain prompt
+//                  into the composer for the user to edit and send. The folder grant is given back
+//                  at once: the plugin only needs the path, never access to the files.
+
+const SETUP_PROMPT = folder =>
+  `Set up a RestoreProof recovery drill for the app in ${folder}. Find its backups and its Docker image, ` +
+  'ask me what a customer does in the app, write the recovery contract, show me the plan, then run the drill.'
+
+async function startDemo() {
+  haptic('tap')
+  const sent = host.composer && host.composer.submit ? host.composer.submit(null, '/drill demo') : false
+  if (!sent) host.notify({ kind: 'info', message: 'Open a chat and send /drill demo to run the demo drill.' })
+}
+
+async function startSetup() {
+  haptic('tap')
+  let folder = null
+  try {
+    if (ctxRef.files && ctxRef.files.requestFolder) {
+      const r = await ctxRef.files.requestFolder()
+      if (r && r.ok && r.folder) {
+        folder = r.folder.path
+        ctxRef.files.release(r.folder.id).catch(() => {})
+      } else if (r && r.ok) {
+        return // cancelled
+      }
+    }
+  } catch {}
+  const text = SETUP_PROMPT(folder || '<your app folder>')
+  const put = host.composer && host.composer.setDraft ? await host.composer.setDraft(null, text) : false
+  if (!put) host.notify({ kind: 'info', message: `Open a chat and ask: ${text}` })
+}
+
+function Need({ n, title, text }) {
+  return jsxs('li', {
+    style: { display: 'grid', gridTemplateColumns: '18px minmax(0, 1fr)', gap: 8, alignItems: 'baseline' },
     children: [
-      jsx('span', { style: { font: `600 15px/1.3 ${SANS}`, color: FG }, children: 'No drills yet' }),
-      jsx('span', { children: 'A backup job saying “success” is a claim. A drill is the proof.' }),
-      jsx(Mono, { children: 'Ask Hermes to prove your app can come back from last night’s backup, or run /drill run restoreproof.yaml' })
+      jsx(Mono, { children: String(n) }),
+      jsxs('span', {
+        style: { minWidth: 0, font: `13px/1.5 ${SANS}`, color: MUTED },
+        children: [jsx('span', { style: { color: FG, fontWeight: 600 }, children: title }), ` ${text}`]
+      })
+    ]
+  })
+}
+
+function GetStarted({ compact }) {
+  const art = useArt()
+  return jsxs('section', {
+    style: {
+      background: SURFACE,
+      border: `1px solid ${BORDER}`,
+      borderRadius: RADIUS,
+      overflow: 'hidden',
+      display: 'flex',
+      flexDirection: 'column',
+      font: `14px/1.55 ${SANS}`,
+      color: FG
+    },
+    children: [
+      !compact && art ? jsx('img', { src: art, alt: '', style: { display: 'block', width: '100%', height: 120, objectFit: 'cover', objectPosition: 'center 58%' } }) : null,
+      jsxs('div', {
+        style: { padding: 16, display: 'flex', flexDirection: 'column', gap: 14 },
+        children: [
+          jsxs('div', {
+            style: { display: 'flex', flexDirection: 'column', gap: 4 },
+            children: [
+              jsx('span', { style: { font: `600 16px/1.3 ${SANS}` }, children: compact ? 'Start a new drill' : 'Prove your app can come back' }),
+              compact
+                ? null
+                : jsx('span', {
+                    style: { font: `13px/1.5 ${SANS}`, color: MUTED },
+                    children: 'A backup that says “success” is a claim. A drill restores it into a sealed sandbox, starts your app and tries it like a customer.'
+                  })
+            ]
+          }),
+          jsxs('div', {
+            style: { display: 'flex', flexDirection: 'column', gap: 8 },
+            children: [
+              jsx(Button, { onClick: startDemo, children: 'Run the demo' }),
+              jsx(Mono, { children: 'a billing app whose backup said “success” but lost 55 invoices · about a minute' }),
+              jsx('div', { style: { height: 4 } }),
+              jsx(Button, { variant: 'outline', onClick: startSetup, children: 'Set up my app…' }),
+              jsx(Mono, { children: 'pick the app’s folder; Hermes finds the backups and asks the rest' })
+            ]
+          }),
+          compact
+            ? null
+            : jsxs('div', {
+                style: { display: 'flex', flexDirection: 'column', gap: 6, borderTop: `1px solid ${BORDER}`, paddingTop: 12 },
+                children: [
+                  jsx(Mono, { children: 'what you need' }),
+                  jsxs('ol', {
+                    style: { listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 4 },
+                    children: [
+                      jsx(Need, { n: 1, title: 'Docker', text: 'running on this machine.' }, 1),
+                      jsx(Need, { n: 2, title: 'A backup', text: 'folder: a database dump and file archives.' }, 2),
+                      jsx(Need, { n: 3, title: 'Your app’s Docker image,', text: 'the one you deploy.' }, 3)
+                    ]
+                  })
+                ]
+              })
+        ]
+      })
     ]
   })
 }
@@ -506,6 +610,7 @@ function Pane() {
   useEffect(() => {
     refresh()
   }, [])
+  const [starting, setStarting] = useState(false)
   const latest = runs.find(r => r.verdict !== 'RUNNING')
   const showId = selected || (latest && latest.run_id)
   const card = showId ? cards[showId] : null
@@ -513,11 +618,29 @@ function Pane() {
   if (error) body = jsx('div', { style: { color: FAIL, font: `13px/1.5 ${SANS}` }, children: error })
   else if (live && !selected) body = jsx(LiveDrill, { run: live })
   else if (card) body = jsx(EvidenceCard, { card, maxFindings: 6 })
-  else if (!runs.length) body = jsx(Empty, {})
+  else if (!runs.length) body = jsx(GetStarted, {})
   else body = jsx(GlyphSpinner, { ariaLabel: 'Loading' })
+  const hasRuns = runs.length > 0 && !error
   return jsxs('div', {
     style: { height: '100%', overflowY: 'auto', padding: 12, display: 'flex', flexDirection: 'column', gap: 16, boxSizing: 'border-box' },
-    children: [body, jsx(History, { runs, selected: showId })]
+    children: [
+      body,
+      hasRuns && starting ? jsx(GetStarted, { compact: true }) : null,
+      hasRuns
+        ? jsx('div', {
+            children: jsx(Button, {
+              size: 'sm',
+              variant: 'outline',
+              onClick: () => {
+                haptic('tap')
+                setStarting(v => !v)
+              },
+              children: starting ? 'Close' : 'New drill'
+            })
+          })
+        : null,
+      jsx(History, { runs, selected: showId })
+    ]
   })
 }
 
@@ -657,7 +780,7 @@ function reduceEvents(events, t) {
         else s.nodes = { ...s.nodes, [e.role]: { ...(s.nodes[e.role] || {}), name: e.name, image: e.image || (s.nodes[e.role] || {}).image, status: e.action } }
         break
       case 'restored':
-        if (e.what === 'database') s.db = { tables: e.tables, rows: e.rows }
+        if (e.what === 'database') s.db = { tables: e.tables, rows: e.rows, units: e.units || ['tables', 'rows'] }
         break
       case 'progress': {
         const f = s.files[e.what] || {}
@@ -720,7 +843,7 @@ function logLine(e) {
         }`
       }
     case 'restored':
-      return { text: `database restored · ${num(e.tables)} tables, ${num(e.rows)} rows` }
+      return { text: `database restored · ${num(e.tables)} ${(e.units || ['tables'])[0]}, ${num(e.rows)} ${(e.units || [0, 'rows'])[1]}` }
     case 'progress':
       if (e.done !== e.total) return null
       return { text: `${e.what}: ${num(e.done)} files ${e.unit === 'checksummed' ? 'checksummed' : 'written to scratch storage'}` }
@@ -879,36 +1002,6 @@ function Bar({ done, total, active }) {
   })
 }
 
-function StageStrip({ s, failedAtEnd }) {
-  const now = s.upTo
-  return jsx('ol', {
-    style: { listStyle: 'none', margin: 0, padding: 0, display: 'grid', gridTemplateColumns: 'repeat(6, minmax(0, 1fr))', gap: 6 },
-    children: STAGE_ORDER.map((st, i) => {
-      const startedAt = s.stageAt[st]
-      const nextStage = STAGE_ORDER.slice(i + 1).find(x => s.stageAt[x] != null)
-      const ended = nextStage ? s.stageAt[nextStage] : s.done && startedAt != null ? s.done.t : null
-      const current = s.stage === st && !s.done
-      const failed = s.failedStages.has(st) || (st === 'CLEANING' && failedAtEnd)
-      const reached = startedAt != null
-      const mark = failed ? '✗' : current ? '●' : reached ? '✓' : '·'
-      const color = failed ? FAIL : current ? PRIMARY : reached ? OK : MUTED
-      const dur = reached ? (ended != null ? ended : now) - startedAt : null
-      return jsxs(
-        'li',
-        {
-          'aria-current': current ? 'step' : undefined,
-          style: { borderTop: `2px solid ${current ? PRIMARY : failed ? FAIL : reached ? BORDER : BORDER}`, paddingTop: 6, minWidth: 0 },
-          children: [
-            jsx(Mono, { size: 12, color, children: `${mark} ${STAGE_LABEL[st]}` }),
-            jsx(Mono, { style: { display: 'block' }, children: dur != null ? secs(Math.max(0, dur)) : '—' })
-          ]
-        },
-        st
-      )
-    })
-  })
-}
-
 function BackupPanel({ s }) {
   const rows = s.artifacts.map(a =>
     jsxs(
@@ -976,53 +1069,6 @@ function BackupPanel({ s }) {
   })
 }
 
-function Node({ role, title, node, detail, last, legacy }) {
-  const status = node ? node.status : null
-  const up = status === 'started'
-  const gone = status === 'removed'
-  return jsxs('li', {
-    style: {
-      display: 'grid',
-      gridTemplateColumns: '12px minmax(0, 1fr)',
-      columnGap: 10,
-      alignItems: 'start',
-      paddingBottom: last ? 0 : 10,
-      borderBottom: last ? 0 : `1px solid ${BORDER}`,
-      opacity: gone || !status ? 0.55 : 1,
-      transition: prefersReducedMotion() ? 'none' : 'opacity 240ms ease'
-    },
-    children: [
-      jsx('span', {
-        'aria-hidden': true,
-        style: {
-          width: 10,
-          height: 10,
-          marginTop: 4,
-          borderRadius: 99,
-          boxSizing: 'border-box',
-          border: `2px solid ${up ? OK : status === 'created' ? FG : MUTED}`,
-          background: up ? OK : 'transparent'
-        }
-      }),
-      jsxs('div', {
-        style: { minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2 },
-        children: [
-          jsxs('div', {
-            style: { display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'baseline' },
-            children: [
-              jsx('span', { style: { font: `600 13px/1.4 ${SANS}`, color: FG }, children: title }),
-              jsx(Mono, { children: !status ? (legacy ? 'not recorded' : 'not started') : gone ? 'removed' : status === 'created' ? 'created' : 'running' })
-            ]
-          }),
-          node && node.image ? jsx(Mono, { style: { overflowWrap: 'anywhere' }, children: node.image }) : null,
-          detail ? jsx('span', { style: { font: `13px/1.45 ${SANS}`, color: MUTED }, children: detail }) : null
-        ]
-      })
-    ],
-    'aria-label': `${role} ${status || 'not started'}`
-  })
-}
-
 function RequestRow({ step, index, reduced }) {
   const req = step.request
   const res = step.response
@@ -1075,57 +1121,6 @@ function RequestRow({ step, index, reduced }) {
   )
 }
 
-function NetworkPanel({ s, finished, reduced }) {
-  const boot = s.checks.find(c => c.kind === 'service')
-  const nodes = s.nodes
-  const net = s.net
-  const steps = s.journeys.flatMap(j => j.steps.filter(Boolean))
-  const legacy = finished && !s.hasResources && !s.blocked
-  return jsx(Panel, {
-    title: 'Isolated network',
-    aside: net ? net.name : null,
-    children: jsxs('div', {
-      style: {
-        border: `1px dashed ${net && net.status !== 'removed' ? FG : BORDER}`,
-        borderRadius: RADIUS,
-        padding: 12,
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 12,
-        opacity: net && net.status === 'removed' ? 0.6 : 1
-      },
-      children: [
-        jsx(Mono, {
-          children: legacy
-            ? 'This run was recorded before RestoreProof logged its containers; stages and checks are shown.'
-            : !net
-              ? s.blocked
-                ? 'never created: nothing was started'
-                : 'not created yet'
-              : net.status === 'removed'
-                ? 'removed at cleanup, confirmed by re-listing'
-                : 'docker network --internal · no route to the internet or production'
-        }),
-        jsxs('ul', {
-          style: { listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 10 },
-          children: [
-            jsx(Node, { role: 'database', title: 'Database', legacy, node: nodes.database, detail: s.db ? `${num(s.db.rows)} rows in ${num(s.db.tables)} tables restored` : nodes.database && nodes.database.status === 'started' ? 'loading the dump…' : null }, 'db'),
-            jsx(Node, { role: 'app', title: 'App', legacy, node: nodes.app, detail: boot ? `${boot.status === 'PASS' ? '✓' : '✗'} ${boot.summary}` : null }, 'app'),
-            jsx(Node, { role: 'probe', title: 'Journey probe', legacy, node: nodes.probe, detail: steps.length ? 'requests to the app, from inside the network' : null, last: true }, 'probe')
-          ]
-        }),
-        steps.length
-          ? jsx('ol', {
-              'aria-label': 'Probe requests',
-              style: { listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 10 },
-              children: steps.map((step, i) => jsx(RequestRow, { step, index: i, reduced }, i))
-            })
-          : null
-      ]
-    })
-  })
-}
-
 function RefGrid({ refs }) {
   const missing = useMemo(() => {
     const m = new Set()
@@ -1156,67 +1151,6 @@ function RefGrid({ refs }) {
         ]
       })
     ]
-  })
-}
-
-function ChecksPanel({ s, finished }) {
-  const cards = useValue($cards)
-  const doneId = s.done && s.done.run_id
-  useEffect(() => {
-    // The finished run's card carries the same plain headline as the report and chat messages.
-    if (finished && doneId) loadCard(doneId).catch(() => {})
-  }, [finished, doneId])
-  const headline = (doneId && cards[doneId] && cards[doneId].headline) || (s.done ? sentence(s.done.reason) : '')
-  const failed = s.checks.filter(c => c.mandatory && (c.status === 'FAIL' || c.status === 'ERROR'))
-  const passed = s.checks.filter(c => c.status === 'PASS')
-  return jsx(Panel, {
-    title: 'Checks',
-    aside: s.checks.length ? `${passed.length} passed · ${failed.length} failed` : null,
-    children: jsxs('div', {
-      style: { display: 'flex', flexDirection: 'column', gap: 14 },
-      children: [
-        s.refs
-          ? jsx(RefGrid, { refs: s.refs })
-          : jsx(Mono, {
-              children: s.done
-                ? s.checks.some(c => c.kind === 'reference') || !s.checks.some(c => c.kind)
-                  ? 'the per-file map was not recorded in this run; any result is listed below'
-                  : 'no file references were checked'
-                : s.stage === 'VALIDATING'
-                  ? 'checking…'
-                  : 'file references are checked after the app boots'
-            }),
-        jsx('ul', {
-          style: { listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 6, fontSize: 13 },
-          children: s.checks
-            .slice(-8)
-            .map(c => jsx(CheckLine, { ok: c.status === 'PASS', text: sentence(c.name), fact: c.status === 'PASS' ? null : c.summary }, c.id))
-        }),
-        s.done
-          ? jsxs('div', {
-              'aria-live': 'polite',
-              style: { borderTop: `1px solid ${BORDER}`, paddingTop: 12, display: 'flex', flexDirection: 'column', gap: 10 },
-              children: [
-                jsxs('div', {
-                  style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' },
-                  children: [jsx(VerdictLabel, { verdict: s.done.verdict }), jsx(Mono, { children: `at ${at(s.done.t)}` })]
-                }),
-                jsx('span', { style: { font: `13px/1.5 ${SANS}`, color: FG }, children: headline }),
-                finished
-                  ? jsx('div', {
-                      children: jsx(Button, {
-                        size: 'sm',
-                        variant: 'outline',
-                        onClick: () => loadCard(s.done.run_id).then(openReport).catch(() => {}),
-                        children: 'Open report'
-                      })
-                    })
-                  : null
-              ]
-            })
-          : null
-      ]
-    })
   })
 }
 
@@ -1307,10 +1241,344 @@ function Controls({ p, finished }) {
   })
 }
 
+const PLAIN_STAGE = {
+  PREFLIGHT: 'Check the backup',
+  PROVISIONING: 'Seal a sandbox',
+  RESTORING: 'Restore',
+  STARTING: 'Start the app',
+  VALIDATING: 'Try it as a customer',
+  CLEANING: 'Clean up'
+}
+
+const $art = atom(null) // the halftone emblem as a data URL; '' while loading or unavailable
+
+function useArt() {
+  const art = useValue($art)
+  useEffect(() => {
+    if ($art.get() !== null) return
+    $art.set('')
+    api('/art')
+      .then(r => $art.set(`data:image/jpeg;base64,${r.jpeg}`))
+      .catch(() => {})
+  }, [])
+  return art
+}
+
+// Six steps in plain words. The current one is marked; a failed one says so.
+function Steps({ s, failedAtEnd }) {
+  return jsx('ol', {
+    'aria-label': 'Drill steps',
+    style: { listStyle: 'none', margin: 0, padding: 0, display: 'grid', gridTemplateColumns: 'repeat(6, minmax(0, 1fr))', gap: 8 },
+    children: STAGE_ORDER.map((st, i) => {
+      const reached = s.stageAt[st] != null
+      const current = s.stage === st && !s.done
+      const failed = s.failedStages.has(st) || (st === 'CLEANING' && failedAtEnd)
+      const color = failed ? FAIL : current ? PRIMARY : reached ? FG : MUTED
+      return jsxs(
+        'li',
+        {
+          'aria-current': current ? 'step' : undefined,
+          style: {
+            borderTop: `2px solid ${failed ? FAIL : current ? PRIMARY : reached ? MUTED : BORDER}`,
+            paddingTop: 8,
+            minWidth: 0,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 2
+          },
+          children: [
+            jsx(Mono, { children: failed ? `${i + 1} · failed` : reached && !current ? `${i + 1} · done` : `${i + 1}` }),
+            jsx('span', { style: { font: `${current ? 600 : 400} 12px/1.35 ${SANS}`, color }, children: PLAIN_STAGE[st] })
+          ]
+        },
+        st
+      )
+    })
+  })
+}
+
+function activeFiles(s) {
+  for (const [name, f] of Object.entries(s.files)) {
+    const w = f.files
+    if (w && w.done < w.total) return { name, ...w }
+  }
+  return null
+}
+
+// The one sentence that says what is happening right now, plus a progress bar while files restore.
+function nowLine(s) {
+  if (s.blocked) return { text: `The drill could not start: ${s.blocked}` }
+  const steps = s.journeys.flatMap(j => j.steps.filter(Boolean))
+  const last = steps[steps.length - 1]
+  switch (s.stage) {
+    case 'PROVISIONING':
+      return { text: 'Building a sealed sandbox with no internet access.' }
+    case 'RESTORING': {
+      const f = activeFiles(s)
+      if (f) return { text: `Restoring ${f.name}: ${num(f.done)} of ${num(f.total)} files.`, bar: f }
+      if (s.db) return { text: `Database restored: ${num(s.db.rows)} ${s.db.units[1]} in ${num(s.db.tables)} ${s.db.units[0]}.` }
+      return { text: 'Loading the database from the backup.' }
+    }
+    case 'STARTING':
+      return { text: 'Starting your app on the restored data.' }
+    case 'VALIDATING':
+      if (last && last.request && !last.response) return { text: `A test customer asks for ${last.request.path}` }
+      if (last && last.response) {
+        const r = last.response
+        return {
+          text: r.ok
+            ? `${last.request.path} answered ${r.status}, as a customer expects.`
+            : `${last.request.path} answered ${r.status ?? 'nothing'}. A customer would see an error.`
+        }
+      }
+      if (s.refs) {
+        return {
+          text: s.refs.missing
+            ? `${num(s.refs.missing)} of the ${num(s.refs.total)} files the database points to did not come back.`
+            : `All ${num(s.refs.total)} files the database points to came back.`
+        }
+      }
+      return { text: 'Trying the app the way a customer would.' }
+    case 'CLEANING':
+      return {
+        text: s.cleanup && s.cleanup.ok ? 'Everything the drill made is removed. Nothing is left running.' : 'Cleaning up: removing everything the drill made.'
+      }
+    default:
+      return {
+        text: s.artifacts.length
+          ? `Checking the backup: ${s.artifacts.length} part${s.artifacts.length === 1 ? '' : 's'} found.`
+          : 'Checking that the backup is all there.'
+      }
+  }
+}
+
+function Box({ title, state, fact, tone, gone }) {
+  const color = tone === 'bad' ? FAIL : tone === 'ok' ? OK : tone === 'active' ? PRIMARY : MUTED
+  return jsxs('div', {
+    style: {
+      border: `1px solid ${tone === 'bad' ? FAIL : BORDER}`,
+      borderRadius: RADIUS,
+      background: SURFACE,
+      padding: '10px 12px',
+      minWidth: 0,
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 4,
+      opacity: gone ? 0.5 : 1,
+      transition: prefersReducedMotion() ? 'none' : 'opacity 240ms ease'
+    },
+    children: [
+      jsxs('div', {
+        style: { display: 'flex', alignItems: 'center', gap: 6 },
+        children: [
+          jsx('span', { 'aria-hidden': true, style: { width: 7, height: 7, borderRadius: 99, flex: 'none', background: color } }),
+          jsx('span', { style: { font: `600 13px/1.3 ${SANS}`, color: FG }, children: title })
+        ]
+      }),
+      jsx(Mono, { color, children: state }),
+      fact ? jsx('span', { style: { font: `12px/1.45 ${SANS}`, color: MUTED, overflowWrap: 'anywhere' }, children: fact }) : null
+    ]
+  })
+}
+
+// The sandbox as three boxes: the restored database, the app on top of it, and the test customer.
+function Sandbox({ s, finished }) {
+  const n = s.nodes
+  const net = s.net
+  const boot = s.checks.find(c => c.kind === 'service')
+  const answered = s.journeys.flatMap(j => j.steps.filter(x => x && x.response))
+  const okCount = answered.filter(x => x.response.ok).length
+  const bad = answered.find(x => !x.response.ok)
+  const legacy = finished && !s.hasResources && !s.blocked
+  const word = node =>
+    !node ? (legacy ? 'not recorded' : 'waiting') : node.status === 'removed' ? 'removed' : node.status === 'started' ? 'running' : 'starting'
+  const live = node => node && node.status !== 'removed'
+  const arrow = key => jsx('span', { 'aria-hidden': true, style: { alignSelf: 'center', textAlign: 'center', color: MUTED, font: `13px ${MONO}` }, children: '→' }, key)
+  return jsxs('section', {
+    'aria-label': 'Sandbox',
+    style: {
+      border: `1px dashed ${net && net.status !== 'removed' ? MUTED : BORDER}`,
+      borderRadius: RADIUS,
+      padding: 12,
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 10
+    },
+    children: [
+      jsxs('div', {
+        style: { display: 'flex', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' },
+        children: [
+          jsx(Mono, { children: 'sealed sandbox · no internet, no production' }),
+          jsx(Mono, {
+            children: !net ? (s.blocked ? 'never built' : legacy ? '' : 'not built yet') : net.status === 'removed' ? 'removed and re-checked' : 'open'
+          })
+        ]
+      }),
+      jsxs('div', {
+        style: { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 16px minmax(0, 1fr) 16px minmax(0, 1fr)', gap: 6, alignItems: 'stretch' },
+        children: [
+          jsx(
+            Box,
+            {
+              title: 'Database',
+              state: word(n.database),
+              fact: s.db ? `${num(s.db.rows)} ${s.db.units[1]} restored` : n.database && n.database.status === 'started' ? 'loading the backup…' : null,
+              tone: s.db ? 'ok' : live(n.database) ? 'active' : null,
+              gone: n.database && n.database.status === 'removed'
+            },
+            'db'
+          ),
+          arrow('a1'),
+          jsx(
+            Box,
+            {
+              title: 'Your app',
+              state: boot ? (boot.status !== 'PASS' ? 'did not start' : live(n.app) || !n.app ? 'up and answering' : 'removed') : word(n.app),
+              fact: boot && boot.status !== 'PASS' ? boot.summary : null,
+              tone: boot ? (boot.status === 'PASS' ? 'ok' : 'bad') : live(n.app) ? 'active' : null,
+              gone: n.app && n.app.status === 'removed'
+            },
+            'app'
+          ),
+          arrow('a2'),
+          jsx(
+            Box,
+            {
+              title: 'Test customer',
+              state: answered.length ? `${okCount} of ${answered.length} request${answered.length === 1 ? '' : 's'} worked` : word(n.probe),
+              fact: bad ? `${bad.request.path} → ${bad.response.status ?? 'no reply'}` : null,
+              tone: bad ? 'bad' : answered.length ? 'ok' : live(n.probe) ? 'active' : null,
+              gone: n.probe && n.probe.status === 'removed'
+            },
+            'probe'
+          )
+        ]
+      })
+    ]
+  })
+}
+
+// The answer, once the drill is over: the verdict in words, the plain headline, the one fix.
+function Verdict({ s, finished }) {
+  const cards = useValue($cards)
+  const doneId = s.done && s.done.run_id
+  useEffect(() => {
+    if (finished && doneId) loadCard(doneId).catch(() => {})
+  }, [finished, doneId])
+  const card = doneId ? cards[doneId] : null
+  const v = s.done.verdict
+  const color = VERDICT_COLOR[v] || MUTED
+  const headline = (card && card.headline) || sentence(s.done.reason)
+  return jsxs('section', {
+    'aria-live': 'polite',
+    style: { display: 'flex', flexDirection: 'column', gap: 12 },
+    children: [
+      jsxs('div', {
+        style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' },
+        children: [
+          jsx('span', { 'aria-hidden': true, style: { width: 9, height: 9, borderRadius: 99, background: color } }),
+          jsx('span', { style: { font: `600 13px/1.3 ${SANS}`, color }, children: (card && card.status) || v }),
+          jsx(VerdictLabel, { verdict: v })
+        ]
+      }),
+      jsx('p', { style: { margin: 0, font: `600 20px/1.35 ${SANS}`, color: FG, textWrap: 'pretty' }, children: headline }),
+      s.refs && s.refs.missing ? jsx(RefGrid, { refs: s.refs }) : null,
+      card && card.next_step
+        ? jsxs('div', {
+            style: { border: `1px solid ${color}`, borderRadius: RADIUS, padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 4 },
+            children: [jsx(Mono, { color, children: 'fix this first' }), jsx('span', { style: { font: `13px/1.5 ${SANS}`, color: FG }, children: card.next_step })]
+          })
+        : null,
+      finished
+        ? jsx('div', {
+            children: jsx(Button, { size: 'sm', onClick: () => loadCard(s.done.run_id).then(openReport).catch(() => {}), children: 'Open report' })
+          })
+        : null
+    ]
+  })
+}
+
+function NowPanel({ s }) {
+  const now = nowLine(s)
+  return jsxs('section', {
+    'aria-live': 'polite',
+    style: { display: 'flex', flexDirection: 'column', gap: 8, minHeight: 64 },
+    children: [
+      jsx(Mono, { children: s.stage ? `now · ${PLAIN_STAGE[s.stage].toLowerCase()}` : 'now' }),
+      jsx('p', { style: { margin: 0, font: `600 20px/1.35 ${SANS}`, color: s.blocked ? FAIL : FG, textWrap: 'pretty', overflowWrap: 'anywhere' }, children: now.text }),
+      now.bar ? jsx(Bar, { done: now.bar.done, total: now.bar.total, active: true }) : null
+    ]
+  })
+}
+
+function RequestsPanel({ s, reduced }) {
+  const steps = s.journeys.flatMap(j => j.steps.filter(Boolean))
+  return jsx(Panel, {
+    title: 'Test customer requests',
+    aside: s.net ? s.net.name : null,
+    children: steps.length
+      ? jsx('ol', {
+          'aria-label': 'Probe requests',
+          style: { listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 10 },
+          children: steps.map((step, i) => jsx(RequestRow, { step, index: i, reduced }, i))
+        })
+      : jsx(Mono, { children: s.done ? 'no requests were made' : 'requests start once the app is up' })
+  })
+}
+
+// Everything an engineer wants and nobody else needs, folded until asked for.
+function Technical({ s, events, t, follow, reduced }) {
+  const [open, setOpen] = useState(false)
+  return jsxs('details', {
+    open,
+    onToggle: e => setOpen(e.currentTarget.open),
+    style: { borderTop: `1px solid ${BORDER}`, paddingTop: 12 },
+    children: [
+      jsxs('summary', {
+        style: { cursor: 'pointer', font: `600 13px/1.4 ${SANS}`, color: FG },
+        children: ['Technical details ', jsx(Mono, { children: '· backup files, checks, requests, event log' })]
+      }),
+      open
+        ? jsxs('div', {
+            style: { display: 'flex', flexDirection: 'column', gap: 12, marginTop: 12 },
+            children: [
+              jsxs('div', {
+                style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 12, alignItems: 'start' },
+                children: [jsx(BackupPanel, { s }, 'b'), jsx(ChecksPanel, { s }, 'c'), jsx(RequestsPanel, { s, reduced }, 'r')]
+              }),
+              jsx(EventLog, { events, t, follow })
+            ]
+          })
+        : null
+    ]
+  })
+}
+
+function ChecksPanel({ s }) {
+  const failed = s.checks.filter(c => c.mandatory && (c.status === 'FAIL' || c.status === 'ERROR'))
+  const passed = s.checks.filter(c => c.status === 'PASS')
+  return jsx(Panel, {
+    title: 'Checks',
+    aside: s.checks.length ? `${passed.length} passed · ${failed.length} failed` : null,
+    children: jsxs('div', {
+      style: { display: 'flex', flexDirection: 'column', gap: 14 },
+      children: [
+        s.checks.length
+          ? jsx('ul', {
+              style: { listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 6, fontSize: 13 },
+              children: s.checks.map(c => jsx(CheckLine, { ok: c.status === 'PASS', text: sentence(c.name), fact: c.status === 'PASS' ? null : c.summary }, c.id))
+            })
+          : jsx(Mono, { children: s.done ? 'no checks ran' : 'checks run after the app starts' })
+      ]
+    })
+  })
+}
+
 function DrillView({ runId, live }) {
   const { events, finished, error, loaded, arrivedAt } = useRunEvents(runId)
   const p = usePlayer(events, finished, live)
   const s = useMemo(() => reduceEvents(events, p.t), [events, p.t])
+  const art = useArt()
   const reduced = prefersReducedMotion()
   const [, setNow] = useState(0)
   const running = !finished && p.mode === 'live'
@@ -1342,39 +1610,37 @@ function DrillView({ runId, live }) {
       padding: 20,
       display: 'flex',
       flexDirection: 'column',
-      gap: 16,
+      gap: 18,
       font: `14px/1.55 ${SANS}`,
-      color: FG
+      color: FG,
+      maxWidth: 880
     },
     children: [
       jsxs('header', {
-        style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, flexWrap: 'wrap' },
+        style: { display: 'flex', alignItems: 'center', gap: 14, minWidth: 0 },
         children: [
+          art ? jsx('img', { src: art, alt: '', style: { height: 52, width: 'auto', borderRadius: RADIUS, flex: 'none', display: 'block' } }) : null,
           jsxs('div', {
-            style: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 },
+            style: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0, flex: 1 },
             children: [
-              jsx('span', { style: { font: `600 18px/1.3 ${SANS}` }, children: s.app || 'Recovery drill' }),
-              jsx(Mono, { children: `recovery drill · ${s.label || ''} · ${runId}` })
+              jsx('span', { style: { font: `600 18px/1.3 ${SANS}`, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: s.app || 'Recovery drill' }),
+              jsx(Mono, { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: `recovery drill${s.label ? ` · backup ${s.label}` : ''}` })
             ]
           }),
           jsxs('div', {
-            'aria-live': 'polite',
-            style: { display: 'flex', alignItems: 'center', gap: 10 },
+            style: { display: 'flex', alignItems: 'center', gap: 8, flex: 'none' },
             children: [
               running ? jsx(GlyphSpinner, { ariaLabel: 'Drill running' }) : null,
-              jsx(Mono, { size: 12, color: running ? PRIMARY : MUTED, children: `${status} · ${at(elapsed)}` }),
-              s.done ? jsx(VerdictLabel, { verdict: s.done.verdict }) : null
+              jsx(Mono, { size: 12, color: running ? PRIMARY : MUTED, children: `${status} · ${secs(elapsed)}` })
             ]
           })
         ]
       }),
-      jsx(StageStrip, { s, failedAtEnd: s.cleanup && !s.cleanup.ok }),
+      jsx(Steps, { s, failedAtEnd: s.cleanup && !s.cleanup.ok }),
+      s.done ? jsx(Verdict, { s, finished }) : jsx(NowPanel, { s }),
+      jsx(Sandbox, { s, finished }),
       jsx(Controls, { p, finished }),
-      jsxs('div', {
-        style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 12, alignItems: 'start' },
-        children: [jsx(BackupPanel, { s }, 'b'), jsx(NetworkPanel, { s, finished, reduced }, 'n'), jsx(ChecksPanel, { s, finished }, 'c')]
-      }),
-      jsx(EventLog, { events, t: p.t, follow: p.playing || running })
+      jsx(Technical, { s, events, t: p.t, follow: p.playing || running, reduced })
     ]
   })
 }

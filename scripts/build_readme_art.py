@@ -10,12 +10,13 @@ MET_DIR holds two public-domain originals from The Met's Open Access collection 
 
 Writes:
   assets/art/krater.jpg           the painted scene band, toned
-  assets/banner.jpg               2:1 cover, used by the plugin catalog and as the README hero
   assets/story.png                what a backup status, a health check and a drill each report
   assets/pipeline.png             the six stages of a drill
 
-Needs Pillow, numpy, Microsoft Edge or Chrome (headless, for type and line-art), Franklin Gothic Heavy
-(ships with Windows) and engine/report_fonts.css for Courier Prime and JetBrains Mono. Deterministic:
+The cover (assets/banner.jpg) is built by scripts/build_halftone_art.py.
+
+Needs Pillow, Microsoft Edge or Chrome (headless, for type and line-art) and engine/report_fonts.css for
+Courier Prime and JetBrains Mono. Deterministic:
 no random placement, so a rebuild gives the same images.
 """
 
@@ -29,59 +30,18 @@ import sys
 import tempfile
 from pathlib import Path
 
-import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 
 ROOT = Path(__file__).resolve().parents[1]
 ASSETS = ROOT / "assets"
 ART = ASSETS / "art"
 
-# The catalog's shared poster language: black ground, cream engraving, red sun, blueprint blue, yellow type.
-BLACK, CREAM, SUN, BLUE, YELLOW, RED, DIM = "#0b0b0e", "#efe6d2", "#d6372b", "#4d6bff", "#ffd21f", "#ff5a4e", "#8c8676"
+# The README panels' language: black ground, cream type, blueprint blue, yellow for the verdict.
+BLACK, CREAM, BLUE, YELLOW, RED, DIM = "#0b0b0e", "#efe6d2", "#4d6bff", "#ffd21f", "#ff5a4e", "#8c8676"
 KRATER_BOX = (0.262, 0.335, 0.738, 0.664)
 
 
 # -- source treatments -----------------------------------------------------------------------------------
-
-def engrave(src: Path, width: int, period: float) -> Image.Image:
-    """The statue as cream line-art: an angled line screen that bends with the form and thickens with light."""
-    im = Image.open(src).convert("RGB")
-    w, h = im.size
-    crop = im.crop((int(w * 0.243), int(h * 0.062), int(w * 0.798), int(h * 0.392)))  # head, shoulders, drape
-    ss = 2  # supersample, then reduce, for clean line edges
-    crop = crop.resize((width * ss, round(crop.height * width * ss / crop.width)), Image.LANCZOS)
-    a = np.asarray(crop).astype(np.float32) / 255.0
-    lum = 0.2126 * a[..., 0] + 0.7152 * a[..., 1] + 0.0722 * a[..., 2]
-    warm = a[..., 0] - a[..., 2]  # marble is warm; the museum backdrop is neutral grey
-
-    m = Image.fromarray(((warm > 0.045) * 255).astype(np.uint8))
-    m = m.filter(ImageFilter.MedianFilter(9)).filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.MinFilter(9))
-    mask = np.asarray(m.filter(ImageFilter.GaussianBlur(3 * ss))).astype(np.float32) / 255.0
-    mask = np.clip((mask - 0.35) / 0.3, 0, 1)
-
-    tone = Image.fromarray((lum * 255).astype(np.uint8)).filter(
-        ImageFilter.UnsharpMask(radius=40 * ss, percent=160, threshold=0))
-    t = np.asarray(tone).astype(np.float32) / 255.0
-    lo, hi = np.percentile(t[mask > 0.5], [3, 99.5])
-    t = np.clip((t - lo) / (hi - lo), 0, 1) ** 1.25
-
-    hh, ww = t.shape
-    yy, xx = np.mgrid[0:hh, 0:ww].astype(np.float32)
-    p = period * ss
-    soft = np.asarray(Image.fromarray((t * 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(14 * ss))) / 255.0
-    aa = 1.6 / p
-    ang = np.deg2rad(-28)
-    u = xx * np.cos(ang) + yy * np.sin(ang) + soft * p * 2.2
-    line = np.clip((t * 0.92 - np.abs(((u / p) % 1.0) - 0.5) * 2.0) / aa + 0.5, 0, 1)
-    ang2 = np.deg2rad(52)
-    u2 = xx * np.cos(ang2) + yy * np.sin(ang2) + soft * p
-    hl = np.clip(((t - 0.72) * 2.2 - np.abs(((u2 / (p * 0.75)) % 1.0) - 0.5) * 2.0) / aa + 0.5, 0, 1)
-
-    ink = Image.fromarray((np.maximum(line, hl) * mask * 255).astype(np.uint8))
-    ink = ink.resize((width, round(hh / ss)), Image.LANCZOS)
-    out = Image.new("RGB", ink.size, tuple(int(CREAM[i:i + 2], 16) for i in (1, 3, 5)))
-    out.putalpha(ink)
-    return out
 
 
 def krater_band(src: Path) -> Image.Image:
@@ -134,7 +94,6 @@ html,body{{margin:0;width:{width}px;height:{height}px;overflow:hidden;background
 .stage{{position:relative;width:{width}px;height:{height}px;overflow:hidden}}
 .mono{{font-family:"RP JetBrains Mono",Consolas,monospace}}
 .serif{{font-family:"RP Courier Prime","Courier New",monospace}}
-.poster{{font-family:"Franklin Gothic Heavy","Franklin Gothic","Arial Black",sans-serif;font-weight:900}}
 svg{{position:absolute;inset:0;overflow:visible}}
 {extra_css}</style><body><div class="stage">{body}</div></body>"""
 
@@ -174,97 +133,6 @@ def cross(x: float, y: float, r: float = 7) -> str:
 
 
 # -- the cover -------------------------------------------------------------------------------------------
-
-def cover(figure: Image.Image) -> Image.Image:
-    W, H = 1600, 800
-    fw = 720
-    fh = round(figure.height * fw / figure.width)
-    fx, fy = (W - fw) // 2 + 6, 46
-    uri = data_uri(figure)
-    b1, b2 = 386, 412  # the slice of the figure that slips: the data that did not come back
-
-    files = []
-    for i in range(96):  # 24 x 4 cells; the run in red is where the missing folder sits
-        col, row = i % 24, i // 24
-        gone = 74 <= i <= 79
-        x, y = 74 + col * 15, 520 + row * 15
-        files.append(f'<rect x="{x}" y="{y}" width="11" height="11" fill="{RED if gone else "none"}" '
-                     f'stroke="{RED if gone else BLUE}" stroke-width="1" opacity="{1 if gone else .55}"/>')
-
-    term = [
-        ("$ hermes restoreproof run", CREAM),
-        ("preflight  ✓ artifacts intact", BLUE),
-        ("isolate    ✓ internal network", BLUE),
-        ("restore    ✓ 1,290 rows · 1,149 files", BLUE),
-        ("boot       ✓ GET /health 200", BLUE),
-        ("verify     ✗ 55 invoice PDFs missing", RED),
-        ("           ✗ INV-2152 returns 404", RED),
-    ]
-    term_svg = "".join(f'<text x="92" y="{226 + i * 27}" fill="{c}" class="mono" font-size="14.5" '
-                       f'xml:space="preserve">{t}</text>' for i, (t, c) in enumerate(term))
-
-    body = f"""
-<div style="position:absolute;inset:0;background:{BLACK}"></div>
-<svg width="{W}" height="{H}" viewBox="0 0 {W} {H}"><defs>{PRESS}</defs>
-<path d="M0 400H{W}" stroke="{BLUE}" stroke-width="1" stroke-dasharray="2 7" opacity=".35"/>
-<path d="M800 0V{H}" stroke="{BLUE}" stroke-width="1" stroke-dasharray="2 7" opacity=".22"/>
-{cross(60, 60)}{cross(W - 60, 60)}{cross(60, 470)}{cross(W - 60, 470)}{cross(520, 140)}{cross(1080, 140)}
-<circle cx="788" cy="232" r="186" fill="{SUN}" filter="url(#press)"/>
-</svg>
-<img src="{uri}" style="position:absolute;left:{fx}px;top:{fy}px;width:{fw}px;
-  clip-path:inset(0 0 {fh - (b1 - fy)}px 0)">
-<img src="{uri}" style="position:absolute;left:{fx}px;top:{fy}px;width:{fw}px;
-  clip-path:inset({b2 - fy}px 0 0 0);
-  -webkit-mask-image:linear-gradient(to bottom,#000 0,#000 {520 - fy}px,transparent {612 - fy}px)">
-<img src="{uri}" style="position:absolute;left:{fx + 34}px;top:{fy}px;width:{fw}px;
-  clip-path:inset({b1 - fy}px 0 {fh - (b2 - fy)}px 0)">
-<svg width="{W}" height="{H}" viewBox="0 0 {W} {H}">
-<rect x="{fx + 120}" y="{b1 - 1}" width="210" height="8" fill="{YELLOW}"/>
-<rect x="{fx + 430}" y="{b2 - 6}" width="160" height="6" fill="{BLUE}"/>
-<rect x="{fx + 40}" y="{b1 + 9}" width="64" height="5" fill="{BLUE}"/>
-
-<g>
-<rect x="74" y="168" width="390" height="230" fill="none" stroke="{BLUE}" stroke-width="1.5"/>
-<path d="M74 194H464" stroke="{BLUE}" stroke-width="1"/>
-<text x="88" y="186" fill="{BLUE}" class="mono" font-size="12" letter-spacing="1.5">DRILL · billing-portal</text>
-<text x="450" y="186" fill="{BLUE}" class="mono" font-size="12" text-anchor="end">nightly-2026-11-06</text>
-{term_svg}
-<path d="M74 430H464" stroke="{BLUE}" stroke-width="1" opacity=".6"/>
-<text x="74" y="458" fill="{CREAM}" class="mono" font-size="13">1,204 files the database points to</text>
-<text x="74" y="480" fill="{DIM}" class="mono" font-size="12">55 missing, all in invoices/2026/10/</text>
-<path d="M74 498v6M464 498v6M74 501H464" stroke="{BLUE}" stroke-width="1" opacity=".6"/>
-{''.join(files)}
-</g>
-
-<g>
-<text x="1140" y="176" fill="{BLUE}" class="mono" font-size="12" letter-spacing="1.5">THE BACKUP SAID</text>
-<text x="1140" y="206" fill="{CREAM}" class="serif" font-size="26">“success”</text>
-{icon("archive", 1470, 168, 1.05)}
-<path d="M1140 228H1526" stroke="{BLUE}" stroke-width="1"/>
-<path d="M1333 236v22" stroke="{BLUE}" stroke-width="1.5"/><path d="M1327 252l6 7 6-7" fill="none" stroke="{BLUE}" stroke-width="1.5"/>
-<rect x="1140" y="266" width="386" height="128" fill="none" stroke="{BLUE}" stroke-width="1.5" stroke-dasharray="6 5"/>
-<text x="1154" y="288" fill="{BLUE}" class="mono" font-size="12" letter-spacing="1.5">ISOLATED · NO EGRESS</text>
-{icon("db", 1166, 304, 1.15)}{icon("folder", 1282, 304, 1.15)}{icon("app", 1398, 304, 1.15)}
-<text x="1189" y="380" fill="{BLUE}" class="mono" font-size="12" text-anchor="middle">restore</text>
-<text x="1305" y="380" fill="{BLUE}" class="mono" font-size="12" text-anchor="middle">files</text>
-<text x="1421" y="380" fill="{BLUE}" class="mono" font-size="12" text-anchor="middle">boot</text>
-<path d="M1333 402v22" stroke="{BLUE}" stroke-width="1.5"/><path d="M1327 418l6 7 6-7" fill="none" stroke="{BLUE}" stroke-width="1.5"/>
-<text x="1140" y="450" fill="{BLUE}" class="mono" font-size="12" letter-spacing="1.5">THE DRILL FOUND</text>
-<text x="1140" y="478" fill="{BLUE}" class="mono" font-size="14.5" xml:space="preserve">✓ data    ✓ boot</text>
-<text x="1140" y="502" fill="{RED}" class="mono" font-size="14.5" xml:space="preserve">✗ files   ✗ journey</text>
-<rect x="1140" y="520" width="236" height="56" fill="none" stroke="{YELLOW}" stroke-width="2.5"/>
-<text x="1258" y="559" fill="{YELLOW}" class="serif" font-size="32" font-weight="700" letter-spacing="4"
-  text-anchor="middle">PARTIAL</text>
-</g>
-
-<text x="248" y="652" fill="{CREAM}" class="mono" font-size="15" letter-spacing="6">COMMUNITY PLUGIN · HERMES AGENT</text>
-<text x="800" y="772" fill="{YELLOW}" class="poster" font-size="146" text-anchor="middle" letter-spacing="-1"
-  filter="url(#press)">RESTOREPROOF</text>
-<text x="1352" y="652" fill="{CREAM}" class="mono" font-size="13" text-anchor="end"
-  >Backups are claims. Drills are proof.</text>
-</svg>
-{GRAIN}"""
-    return render(page(body, W, H), W, H).convert("RGB")
 
 
 # -- explanatory graphics --------------------------------------------------------------------------------
@@ -319,9 +187,9 @@ def pipeline() -> Image.Image:
     stages = [
         ("PREFLIGHT", "archive", "Artifacts exist, match the", "recorded digest, unpack safely"),
         ("ISOLATE", "net", "A fresh --internal network:", "no internet, no production"),
-        ("RESTORE", "db", "Dump into a throwaway", "PostgreSQL, files to scratch"),
+        ("RESTORE", "db", "Backup into a throwaway", "database, files to scratch"),
         ("BOOT", "app", "Your image starts on the", "restored data; /health answers"),
-        ("VERIFY", "probe", "SQL invariants, every file", "reference, real user journeys"),
+        ("VERIFY", "probe", "Data checks, every file", "reference, real user journeys"),
         ("CLEAN UP", "broom", "Everything removed, then", "listed again to prove it"),
     ]
     parts = []
@@ -357,14 +225,10 @@ def main() -> None:
         sys.exit(__doc__)
     met = Path(sys.argv[1])
     ART.mkdir(parents=True, exist_ok=True)
-    figure = engrave(met / "hermes.jpg", width=1440, period=9.0)  # drawn at 2x for the 2x render
     krater_band(met / "krater.jpg").save(ART / "krater.jpg", quality=86, optimize=True, progressive=True)
-
-    big = cover(figure)
-    big.resize((1600, 800), Image.LANCZOS).save(ASSETS / "banner.jpg", quality=88, optimize=True, progressive=True)
     for name, fn in (("story.png", story), ("pipeline.png", pipeline)):
         fn().save(ASSETS / name, optimize=True)  # kept at 2x: shown at half size, sharp on dense screens
-    for f in ("art/krater.jpg", "banner.jpg", "story.png", "pipeline.png"):
+    for f in ("art/krater.jpg", "story.png", "pipeline.png"):
         p = ASSETS / f
         print(f"assets/{f}  {p.stat().st_size // 1024} KB")
 

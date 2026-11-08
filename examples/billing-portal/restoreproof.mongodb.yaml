@@ -1,0 +1,71 @@
+# Recovery Contract: what "recovered" means for the Billing Portal on mongodb.
+# Backups: python make_backups.py backups-mongodb --engine mongodb
+# Read by RestoreProof, never executed as a script: every field maps to a fixed,
+# validated operation.
+restoreproof: 1
+
+app:
+  name: billing-portal
+  description: Customer billing portal (staging recovery profile)
+  owner: platform-team
+
+recovery_point:
+  label: nightly-2026-11-06
+  dir: backups-mongodb/nightly-2026-11-06
+  status_file: backup-status.json   # what the backup job claimed
+
+database:
+  engine: mongodb
+  image: mongo:7.0
+  artifact: db.archive.gz           # mongodump --archive --gzip
+  name: billing
+  user: billing
+
+files:
+  - name: uploads
+    artifact: uploads.tar.gz
+    mount: /data/uploads
+    covers_volume: uploads
+
+service:
+  image: restoreproof-demo/billing-portal:1.1
+  port: 8080
+  health: /health
+  env:
+    DATABASE_URL: "mongodb://{db.user}:{db.password}@{db.host}:{db.port}/{db.name}?authSource=admin"
+    UPLOAD_DIR: /data/uploads
+
+checks:
+  data:
+    - name: customers came back
+      query: db.customers.countDocuments()
+      expect: {min: 1}
+    - name: every invoice belongs to a customer
+      query: "db.invoices.countDocuments({customer_id: {$nin: db.customers.distinct('_id')}})"
+      expect: {equals: 0}
+  references:
+    - name: every invoice PDF referenced in the database exists
+      query: "db.invoices.find({pdf_path: {$ne: null}}, {number: 1, pdf_path: 1}).toArray().map(d => [d.number, d.pdf_path])"
+      files: uploads
+  journeys:
+    - name: a customer opens invoice INV-2152 and downloads the PDF
+      steps:
+        - get: /api/invoices/INV-2152
+          expect_status: 200
+          expect_json: {number: INV-2152}
+          capture: {pdf_url: $.pdf_url}
+        - get: "{pdf_url}"
+          expect_status: 200
+          expect_header: {content-type: application/pdf}
+          expect_body_prefix: "%PDF"
+
+objectives:
+  rto: 10m
+  rpo: 24h
+  rpo_watermark_query: "db.invoices.find().sort({created_at: -1}).limit(1).toArray()[0].created_at"
+  incident_time: "2026-11-07T08:00:00Z"   # rehearse an outage at this moment
+
+limits:
+  timeout: 15m
+  db_memory: 512m
+  app_memory: 256m

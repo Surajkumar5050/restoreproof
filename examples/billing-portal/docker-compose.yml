@@ -12,7 +12,7 @@ services:
       - pgdata:/var/lib/postgresql/data
 
   web:
-    image: restoreproof-demo/billing-portal:1.0
+    image: restoreproof-demo/billing-portal:1.1
     build: ./app
     depends_on: [db]
     environment:

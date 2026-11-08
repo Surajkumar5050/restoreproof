@@ -9,12 +9,35 @@ from __future__ import annotations
 
 import gzip
 import re
+import sqlite3
 from pathlib import Path
 
+from . import databases
 from .util import dump_yaml_text, load_yaml_text
 
 COMPOSE_NAMES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
-DB_SUFFIXES = (".sql.gz", ".sql", ".dump", ".pgdump")
+DB_SUFFIXES = tuple(dict.fromkeys(x for e in databases.ENGINES.values() for x in e.artifact_suffixes))
+# Compose image name fragments that identify a database service, most specific first.
+DB_IMAGES = (("mariadb", "mariadb"), ("mysql", "mysql"), ("mongo", "mongodb"), ("postgres", "postgres"))
+# Where each engine's official image reads its database name and user.
+DB_ENV = {"postgres": (("POSTGRES_DB", "POSTGRES_USER"), ("POSTGRES_USER",)),
+          "mysql": (("MYSQL_DATABASE",), ("MYSQL_USER",)),
+          "mariadb": (("MARIADB_DATABASE", "MYSQL_DATABASE"), ("MARIADB_USER", "MYSQL_USER")),
+          "mongodb": (("MONGO_INITDB_DATABASE",), ("MONGO_INITDB_ROOT_USERNAME",))}
+URL_TEMPLATES = {
+    "postgres": "postgresql://{db.user}:{db.password}@{db.host}:{db.port}/{db.name}",
+    "mysql": "mysql://{db.user}:{db.password}@{db.host}:{db.port}/{db.name}",
+    "mariadb": "mysql://{db.user}:{db.password}@{db.host}:{db.port}/{db.name}",
+    "mongodb": "mongodb://{db.user}:{db.password}@{db.host}:{db.port}/{db.name}?authSource=admin",
+    "sqlite": "sqlite:///{db.path}",
+}
+TABLES_CHECK = {
+    "postgres": "select count(*) from information_schema.tables where table_schema = 'public'",
+    "mysql": "select count(*) from information_schema.tables where table_schema = database()",
+    "mariadb": "select count(*) from information_schema.tables where table_schema = database()",
+    "sqlite": "select count(*) from sqlite_master where type = 'table'",
+    "mongodb": "db.getCollectionNames().length",
+}
 FILE_SUFFIXES = (".tar.gz", ".tgz", ".tar")
 REF_COLUMN = re.compile(r"(path|file|filename|attachment|object_key|storage_key|s3_key|blob|upload)", re.I)
 
@@ -51,9 +74,43 @@ def _backup_sets(root: Path) -> list[Path]:
     return sorted(sets, key=lambda p: p.name)
 
 
-def _dump_text(path: Path, limit: int = 4 * 1024 * 1024) -> str:
+def _sqlite_schema(path: Path) -> str:
+    """CREATE TABLE statements of an SQLite backup, read without changing it."""
     try:
-        if path.name.lower().endswith(".gz"):
+        con = sqlite3.connect(f"file:{path.as_posix()}?mode=ro&immutable=1", uri=True)
+        try:
+            rows = con.execute("select sql from sqlite_master where type = 'table' and sql is not null").fetchall()
+        finally:
+            con.close()
+        return "\n".join(r[0].rstrip(";") + ";" for r in rows)
+    except sqlite3.Error:
+        return ""
+
+
+def _engine_for(db_art: Path | None, db_svc, sql_head: str) -> str:
+    if db_svc:
+        image = str(db_svc[1].get("image", "")).lower()
+        for fragment, engine in DB_IMAGES:
+            if fragment in image:
+                return engine
+    if db_art:
+        low = db_art.name.lower()
+        if low.endswith(databases.SQLite.artifact_suffixes):
+            return "sqlite"
+        if low.endswith(databases.MongoDB.artifact_suffixes):
+            return "mongodb"
+        if "MariaDB dump" in sql_head:
+            return "mariadb"
+        if "MySQL dump" in sql_head:
+            return "mysql"
+    return "postgres"
+
+
+def _dump_text(path: Path, limit: int = 4 * 1024 * 1024) -> str:
+    if path.name.lower().endswith(databases.SQLite.artifact_suffixes) and not path.name.lower().endswith(".gz"):
+        return _sqlite_schema(path)
+    try:
+        if path.name.lower().endswith(".sql.gz"):
             with gzip.open(path, "rb") as fh:
                 return fh.read(limit).decode("utf-8", "replace")
         if path.name.lower().endswith(".sql"):
@@ -65,19 +122,21 @@ def _dump_text(path: Path, limit: int = 4 * 1024 * 1024) -> str:
 
 def _reference_columns(sql: str) -> list[tuple[str, str]]:
     found = []
-    for m in re.finditer(r"CREATE TABLE\s+(?:public\.)?\"?(\w+)\"?\s*\((.*?)\);", sql, re.I | re.S):
+    for m in re.finditer(r"CREATE TABLE\s+(?:IF NOT EXISTS\s+)?(?:public\.)?[\"`]?(\w+)[\"`]?\s*\((.*?)\)\s*[^;]*;",
+                         sql, re.I | re.S):
         table, body = m.group(1), m.group(2)
-        for col in re.finditer(r"(?:^|,)\s*\"?(\w+)\"?\s+(text|character varying|varchar)", body, re.I):
+        for col in re.finditer(r"(?:^|,)\s*[\"`]?(\w+)[\"`]?\s+(text|character varying|varchar)", body, re.I):
             if REF_COLUMN.search(col.group(1)):
                 found.append((table, col.group(1)))
     return found
 
 
 def _key_column(sql: str, table: str) -> str:
-    m = re.search(rf"CREATE TABLE\s+(?:public\.)?\"?{table}\"?\s*\((.*?)\);", sql, re.I | re.S)
+    m = re.search(rf"CREATE TABLE\s+(?:IF NOT EXISTS\s+)?(?:public\.)?[\"`]?{table}[\"`]?\s*\((.*?)\)\s*[^;]*;",
+                  sql, re.I | re.S)
     if m:
         for cand in ("number", "slug", "name", "id"):
-            if re.search(rf"(?:^|,|\()\s*\"?{cand}\"?\s", m.group(1), re.I):
+            if re.search(rf"(?:^|,|\()\s*[\"`]?{cand}[\"`]?\s", m.group(1), re.I):
                 return cand
     return "id"
 
@@ -94,8 +153,8 @@ def discover(project: Path, backups: str | None = None) -> dict:
 
     db_svc = app_svc = None
     for name, svc in services.items():
-        image = str(svc.get("image", ""))
-        if "postgres" in image and not db_svc:
+        image = str(svc.get("image", "")).lower()
+        if not db_svc and any(fragment in image for fragment, _ in DB_IMAGES):
             db_svc = (name, svc)
     for name, svc in services.items():
         if db_svc and name == db_svc[0]:
@@ -145,14 +204,27 @@ def discover(project: Path, backups: str | None = None) -> dict:
                     files_entries.append({"name": vol, "artifact": art.name, "mount": target, "covers_volume": vol})
                     break
         coverage.append({"volume": vol, "mounted_at": mounts, "covered_by": covered_by})
+    # Archives no compose volume claimed still belong in the contract; where the app reads them is
+    # the user's to say, so the mount is left as a TODO that the contract check refuses until filled.
+    used = {e["artifact"] for e in files_entries}
+    for art in file_arts:
+        if art.name not in used:
+            stem = re.sub(r"[^a-z0-9_.-]", "-", art.name.lower().split(".")[0])[:63] or "files"
+            if stem not in {e["name"] for e in files_entries}:
+                files_entries.append({"name": stem, "artifact": art.name,
+                                      "mount": "TODO: the folder inside your app container that holds these files"})
 
     sql = _dump_text(db_art) if db_art else ""
-    refs = _reference_columns(sql)
+    engine = _engine_for(db_art, db_svc, sql[:2000])
+    adapter = databases.get(engine)
+    refs = _reference_columns(sql) if engine != "mongodb" else []
     db_env = (db_svc[1].get("environment") or {}) if db_svc else {}
     if isinstance(db_env, list):
         db_env = dict(item.split("=", 1) for item in db_env if "=" in item)
-    db_name = str(db_env.get("POSTGRES_DB") or db_env.get("POSTGRES_USER") or "app")
-    db_user = str(db_env.get("POSTGRES_USER") or "app")
+    name_keys, user_keys = DB_ENV.get(engine, ((), ()))
+    db_name = str(next((db_env[k] for k in name_keys if db_env.get(k)), None) or "app")
+    db_user = str(next((db_env[k] for k in user_keys if db_env.get(k)), None)
+                  or ("root" if engine in ("mysql", "mariadb") and name_keys else "app"))
 
     env_out = {}
     secrets = []
@@ -162,8 +234,8 @@ def discover(project: Path, backups: str | None = None) -> dict:
             env = dict(item.split("=", 1) if "=" in item else (item, "") for item in env)
         for k, v in env.items():
             v = str(v)
-            if "postgres" in v and "@" in v:
-                env_out[k] = "postgresql://{db.user}:{db.password}@{db.host}:{db.port}/{db.name}"
+            if re.match(r"(?i)^(postgres(ql)?|mysql|mariadb|mongodb(\+srv)?)://", v) or v.lower().startswith("sqlite:"):
+                env_out[k] = URL_TEMPLATES[engine]
             elif "${" in v:
                 secrets.append(k)
                 env_out[k] = "{secret." + k + "}"
@@ -185,8 +257,10 @@ def discover(project: Path, backups: str | None = None) -> dict:
         "recovery_point": {"label": latest.name if latest else "TODO",
                            "dir": str(latest.relative_to(project)).replace("\\", "/") if latest and latest.is_relative_to(project) else str(latest or "TODO"),
                            **({"status_file": status_file} if status_file else {})},
-        "database": {"engine": "postgres", "image": str(db_svc[1].get("image")) if db_svc else "postgres:16-alpine",
-                     "artifact": db_art.name if db_art else "TODO.sql.gz", "name": db_name, "user": db_user,
+        "database": {"engine": engine, "image": str(db_svc[1].get("image")) if db_svc else adapter.default_image,
+                     "artifact": db_art.name if db_art else "TODO.sql.gz",
+                     **({"name": db_name, "user": db_user} if adapter.server
+                        else {"mount": "TODO: the absolute path of the database file inside your app container"}),
                      **({"covers_volume": next((c["volume"] for c in coverage if db_art and c["covered_by"] == db_art.name), None)}
                         if db_art else {})},
         "files": files_entries,
@@ -197,8 +271,8 @@ def discover(project: Path, backups: str | None = None) -> dict:
         "checks": {
             "data": [{"name": f"{t} came back", "sql": f"select count(*) from {t}", "expect": {"min": 1}}
                      for t in sorted({t for t, _ in refs})] or
-                    [{"name": "tables came back", "sql": "select count(*) from information_schema.tables "
-                      "where table_schema = 'public'", "expect": {"min": 1}}],
+                    [{"name": f"{adapter.units[0]} came back", ("query" if engine == "mongodb" else "sql"):
+                      TABLES_CHECK[engine], "expect": {"min": 1}}],
             "references": [],
             "journeys": [],
         },
@@ -211,7 +285,7 @@ def discover(project: Path, backups: str | None = None) -> dict:
                 "name": f"every {table}.{col} points at a restored file",
                 "sql": f"select {_key_column(sql, table)}, {col} from {table} where {col} is not null",
                 "files": target})
-    ts_cols = re.findall(r"\"?(\w*(?:created|updated)_at)\"?\s+timestamp", sql, re.I)
+    ts_cols = re.findall(r"[\"`]?(\w*(?:created|updated)_at)[\"`]?\s+(?:timestamp|datetime|text)", sql, re.I)
     if ts_cols and refs:
         contract["objectives"]["rpo_watermark_sql"] = f"select max({ts_cols[0]}) from {refs[0][0]}"
 

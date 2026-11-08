@@ -8,6 +8,14 @@ description: Prove an application can actually be recovered from its backups. Se
 A backup job saying "success" is a claim. A drill is the proof. Use the RestoreProof tools; never
 replace them with ad-hoc shell commands, and never decide a verdict yourself.
 
+## 0. When the user does not know where to start
+- Explain in two sentences what a drill does (restore the backup into a sealed sandbox, start the app,
+  try it like a customer), then offer two paths: `/drill demo` to see one in about a minute, or setting
+  up their own app. Do not ask for anything else first.
+- To set up their own app you need one thing from them: the app's folder. If they also know where the
+  backups are, take that too; otherwise `restoreproof_discover` looks for them and you ask only if it
+  finds none.
+
 ## 1. Set up (first time for an app)
 1. `restoreproof_discover` on the project folder. Show the user the **coverage lines** first: any
    `NOT COVERED` volume is data no backup holds. Say so plainly.
@@ -46,4 +54,8 @@ replace them with ad-hoc shell commands, and never decide a verdict yourself.
 ## Honest limits to state when relevant
 - Isolation is Docker containers on an internal network with no egress, dropped capabilities and
   resource limits. That suits your own trusted backups and images; it is not a VM boundary for hostile ones.
-- Supported today: PostgreSQL dumps (.sql, .sql.gz, pg_dump custom), tar/tar.gz file archives, one app image.
+- Supported today: PostgreSQL (.sql, .sql.gz, pg_dump custom), MySQL and MariaDB (.sql, .sql.gz),
+  MongoDB (mongodump --archive, optionally --gzip), SQLite (the database file, optionally gzipped);
+  tar/tar.gz file archives; one app image. MongoDB checks use `query:` with a read-only mongosh
+  expression (for references, return `[key, path]` pairs); SQLite needs `database.mount`, the path the
+  app opens, and env uses `{db.path}` instead of host/port/user/password.

@@ -28,7 +28,7 @@ files:
     covers_volume: uploads
 
 service:
-  image: restoreproof-demo/billing-portal:1.0
+  image: restoreproof-demo/billing-portal:1.1
   port: 8080
   health: /health
   compose_file: docker-compose.yml

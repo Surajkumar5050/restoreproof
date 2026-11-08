@@ -24,7 +24,7 @@ from engine.contract import load_contract  # noqa: E402
 from engine.docker import Docker  # noqa: E402
 from engine.runner import PROBE_IMAGE, Drill  # noqa: E402
 
-IMAGES = ("postgres:16-alpine", "restoreproof-demo/billing-portal:1.0", PROBE_IMAGE)
+IMAGES = ("postgres:16-alpine", "restoreproof-demo/billing-portal:1.1", PROBE_IMAGE)
 
 
 def docker_ready() -> str | None:

@@ -7,19 +7,33 @@ Writes two recovery points, both made from the same deterministic dataset:
                                 last days of October (a bad exclude pattern)
   backups/nightly-2026-11-07/   a complete, corrected backup set
 
-Each set has a plain-SQL PostgreSQL dump (db.sql.gz), an uploads archive
-(uploads.tar.gz) and the backup job's own status file (backup-status.json).
+Each set has a database backup, an uploads archive (uploads.tar.gz) and the
+backup job's own status file (backup-status.json). The database backup depends
+on --engine:
 
-Usage: python make_backups.py [output_dir]
+  postgres (default)   db.sql.gz      plain SQL, as pg_dump writes it
+  mysql, mariadb       db.sql.gz      plain SQL, as mysqldump writes it
+  sqlite               db.sqlite      the database file itself
+  mongodb              db.archive.gz  mongodump --archive --gzip (made in a
+                                      throwaway mongo:7.0 container, so it
+                                      needs Docker and that image)
+
+Usage: python make_backups.py [output_dir] [--engine ENGINE]
 """
 
+import argparse
 import gzip
 import hashlib
 import io
 import json
 import random
+import secrets
+import sqlite3
+import subprocess
 import sys
 import tarfile
+import tempfile
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -109,6 +123,111 @@ def sql_dump(customers, invoices) -> bytes:
     return "\n".join(lines).encode()
 
 
+def mysql_dump(customers, invoices, flavour: str) -> bytes:
+    def q(value):
+        return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+    lines = [
+        f"-- {flavour} dump (Billing Portal, generated for the RestoreProof demo)",
+        "SET NAMES utf8mb4;",
+        "CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(200) NOT NULL, email VARCHAR(200) NOT NULL);",
+        "CREATE TABLE invoices (id INT PRIMARY KEY, number VARCHAR(32) NOT NULL UNIQUE,",
+        "  customer_id INT NOT NULL, amount_cents INT NOT NULL, currency VARCHAR(3) NOT NULL DEFAULT 'USD',",
+        "  issued_on DATE NOT NULL, pdf_path VARCHAR(255), created_at DATETIME NOT NULL,",
+        "  FOREIGN KEY (customer_id) REFERENCES customers (id));",
+        "INSERT INTO customers VALUES " + ",".join(f"({c[0]},{q(c[1])},{q(c[2])})" for c in customers) + ";",
+    ]
+    for i in range(0, len(invoices), 200):
+        rows = invoices[i:i + 200]
+        lines.append("INSERT INTO invoices VALUES " + ",".join(
+            f"({v[0]},{q(v[1])},{v[2]},{v[4]},'USD','{v[5].isoformat()}',{q(v[6])},"
+            f"'{v[7].strftime('%Y-%m-%d %H:%M:%S')}')" for v in rows) + ";")
+    lines += ["CREATE INDEX invoices_customer_idx ON invoices (customer_id);", ""]
+    return "\n".join(lines).encode()
+
+
+def sqlite_file(path: Path, customers, invoices) -> None:
+    path.unlink(missing_ok=True)
+    con = sqlite3.connect(path)
+    with con:
+        con.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL)")
+        con.execute("CREATE TABLE invoices (id INTEGER PRIMARY KEY, number TEXT UNIQUE NOT NULL, "
+                    "customer_id INTEGER NOT NULL REFERENCES customers(id), amount_cents INTEGER NOT NULL, "
+                    "currency TEXT NOT NULL DEFAULT 'USD', issued_on TEXT NOT NULL, pdf_path TEXT, "
+                    "created_at TEXT NOT NULL)")
+        con.executemany("INSERT INTO customers VALUES (?, ?, ?)", customers)
+        con.executemany("INSERT INTO invoices VALUES (?, ?, ?, ?, 'USD', ?, ?, ?)",
+                        [(v[0], v[1], v[2], v[4], v[5].isoformat(), v[6], v[7].isoformat()) for v in invoices])
+        con.execute("CREATE INDEX invoices_customer_idx ON invoices (customer_id)")
+    con.close()
+
+
+def docker_binary() -> str:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from engine.docker import docker_binary as find
+
+    found = find()
+    if not found:
+        sys.exit("Docker is needed to write a MongoDB backup (mongodump runs in a throwaway mongo:7.0 container).")
+    return found
+
+
+def mongo_archive(customers, invoices) -> bytes:
+    """A real mongodump --archive --gzip of the dataset, made in a throwaway mongo:7.0 container."""
+    docker = docker_binary()
+    name = f"rp-make-backup-{secrets.token_hex(3)}"
+
+    def run(args, data=None):
+        r = subprocess.run([docker, *args], input=data, capture_output=True, timeout=300)
+        if r.returncode != 0:
+            raise RuntimeError(f"docker {args[0]} failed: {r.stderr.decode('utf-8', 'replace')[-300:]}")
+        return r.stdout
+
+    def date(d):
+        return {"$date": (d if isinstance(d, datetime) else datetime(d.year, d.month, d.day, tzinfo=timezone.utc))
+                .strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+    run(["run", "-d", "--rm", "--name", name, "--network", "none", "mongo:7.0"])
+    try:
+        for _ in range(120):
+            ping = subprocess.run([docker, "exec", name, "mongosh", "--quiet", "--eval", "db.adminCommand({ping: 1}).ok"],
+                                  capture_output=True, timeout=30)
+            if ping.returncode == 0 and ping.stdout.strip() == b"1":
+                break
+            time.sleep(0.5)
+        docs = {
+            "customers": [{"_id": c[0], "name": c[1], "email": c[2]} for c in customers],
+            "invoices": [{"_id": v[0], "number": v[1], "customer_id": v[2], "amount_cents": v[4], "currency": "USD",
+                          "issued_on": date(v[5]), "pdf_path": v[6], "created_at": date(v[7])} for v in invoices],
+        }
+        for coll, rows in docs.items():
+            run(["exec", "-i", name, "mongoimport", "--quiet", "--db", "billing", "--collection", coll, "--jsonArray"],
+                json.dumps(rows).encode())
+        run(["exec", name, "mongosh", "--quiet", "billing", "--eval",
+             "db.invoices.createIndex({customer_id: 1}); db.invoices.createIndex({number: 1}, {unique: true})"])
+        return run(["exec", name, "mongodump", "--quiet", "--db", "billing", "--archive", "--gzip"])
+    finally:
+        subprocess.run([docker, "rm", "-f", name], capture_output=True, timeout=60)
+
+
+DB_FILE = {"postgres": "db.sql.gz", "mysql": "db.sql.gz", "mariadb": "db.sql.gz", "sqlite": "db.sqlite",
+           "mongodb": "db.archive.gz"}
+
+
+def write_database(engine: str, path: Path, customers, invoices, cache: dict) -> None:
+    if engine == "sqlite":
+        sqlite_file(path, customers, invoices)
+        return
+    if "bytes" not in cache:  # both nights hold the same database; make it once
+        cache["bytes"] = (mongo_archive(customers, invoices) if engine == "mongodb"
+                          else sql_dump(customers, invoices) if engine == "postgres"
+                          else mysql_dump(customers, invoices, "MariaDB" if engine == "mariadb" else "MySQL"))
+    if engine == "mongodb":
+        path.write_bytes(cache["bytes"])
+    else:
+        write_gzip(path, cache["bytes"])
+
+
 def write_gzip(path: Path, data: bytes):
     # mtime=0 keeps the archive bytes (and so their digests) reproducible.
     with open(path, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gz:
@@ -138,9 +257,14 @@ def sha256(path: Path) -> str:
 
 
 def main():
-    root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).parent / "backups"
+    parser = argparse.ArgumentParser(description="Write the Billing Portal demo backup sets.")
+    parser.add_argument("output_dir", nargs="?", default=str(Path(__file__).parent / "backups"))
+    parser.add_argument("--engine", default="postgres", choices=sorted(DB_FILE))
+    args = parser.parse_args()
+    root = Path(args.output_dir)
     customers, invoices = dataset()
-    dump = sql_dump(customers, invoices)
+    db_file = DB_FILE[args.engine]
+    cache: dict = {}
     sets = [
         ("nightly-2026-11-06", True, "2026-11-06T23:00:00Z"),
         ("nightly-2026-11-07", False, "2026-11-07T23:00:00Z"),
@@ -148,20 +272,20 @@ def main():
     for name, broken, finished in sets:
         out = root / name
         out.mkdir(parents=True, exist_ok=True)
-        write_gzip(out / "db.sql.gz", dump)
+        write_database(args.engine, out / db_file, customers, invoices, cache)
         files = write_uploads(out / "uploads.tar.gz", invoices, broken)
         status = {
             "job": "billing-portal-nightly",
             "status": "success",
             "finished_at": finished,
             "artifacts": {
-                "db.sql.gz": {"bytes": (out / "db.sql.gz").stat().st_size, "sha256": sha256(out / "db.sql.gz")},
+                db_file: {"bytes": (out / db_file).stat().st_size, "sha256": sha256(out / db_file)},
                 "uploads.tar.gz": {"bytes": (out / "uploads.tar.gz").stat().st_size,
                                    "sha256": sha256(out / "uploads.tar.gz"), "files": files},
             },
         }
         (out / "backup-status.json").write_text(json.dumps(status, indent=2) + "\n")
-        print(f"{name}: status=success, {files} upload files")
+        print(f"{name}: status=success, {args.engine} {db_file}, {files} upload files")
 
 
 if __name__ == "__main__":

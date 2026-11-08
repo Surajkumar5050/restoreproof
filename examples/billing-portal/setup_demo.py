@@ -2,7 +2,7 @@
 
     python examples/billing-portal/setup_demo.py
 
-1. Builds the demo app image (restoreproof-demo/billing-portal:1.0).
+1. Builds the demo app image (restoreproof-demo/billing-portal:1.1).
 2. Pulls postgres:16-alpine and python:3.12-alpine (the drill never pulls on its own).
 3. Writes two backup sets under examples/billing-portal/backups/.
 
@@ -30,7 +30,7 @@ def main() -> None:
     docker = docker_binary()
     if not docker:
         sys.exit("Docker is required: install Docker Desktop (or Docker Engine) and try again.")
-    step("Building the demo app image", [docker, "build", "-q", "-t", "restoreproof-demo/billing-portal:1.0",
+    step("Building the demo app image", [docker, "build", "-q", "-t", "restoreproof-demo/billing-portal:1.1",
                                          str(HERE / "app")])
     step("Pulling postgres:16-alpine", [docker, "pull", "-q", "postgres:16-alpine"])
     step("Pulling python:3.12-alpine (journey probe)", [docker, "pull", "-q", "python:3.12-alpine"])

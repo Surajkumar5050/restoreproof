@@ -9,7 +9,6 @@ timeouts and Ctrl+C.
 
 from __future__ import annotations
 
-import gzip
 import json
 import secrets as pysecrets
 import shutil
@@ -19,7 +18,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
-from . import __version__, archive
+from . import __version__, archive, databases
 from .contract import Contract
 from .docker import LABEL, Docker
 from .util import (Redactor, Stopwatch, human_duration, iso, parse_time, sha256_file, tail,
@@ -27,7 +26,7 @@ from .util import (Redactor, Stopwatch, human_duration, iso, parse_time, sha256_
 
 PROBE_IMAGE = "python:3.12-alpine"
 PROBE_SOURCE = (Path(__file__).parent / "probe.py").read_text(encoding="utf-8")
-SEP = "\x1f"
+SEP = databases.SEP
 
 PASS, FAIL, SKIP, ERROR = "PASS", "FAIL", "SKIPPED", "ERROR"
 
@@ -62,6 +61,7 @@ class Drill:
                  docker: Docker | None = None, run_id: str | None = None) -> None:
         self.c = contract
         self.d = contract.data
+        self.engine = databases.get(self.d["database"]["engine"])
         self.home = home
         self.recovery_dir = contract.recovery_dir(recovery_dir).resolve()
         self.secret_values = dict(secrets or {})
@@ -209,12 +209,9 @@ class Drill:
     def labels(self) -> list[str]:
         return ["--label", f"{LABEL}={self.run_id}"]
 
-    def psql(self, sql: str, timeout: float = 120):
-        # Over the container's local socket (trust auth inside the throwaway container), so no
-        # password ever appears in a command line.
-        db = self.d["database"]
-        return self.dk(["exec", self.db_name, "psql", "-X", "-q", "-v", "ON_ERROR_STOP=1", "-At", "-F", SEP,
-                        "-U", db["user"], "-d", db["name"], "-c", sql], timeout=timeout)
+    def query(self, text: str, timeout: float = 120):
+        """One read-only query from the contract, run inside the throwaway database container."""
+        return self.engine.query(self, self.d["database"], text, timeout)
 
     def env_file(self, name: str, values: dict[str, str]) -> Path:
         """Write container environment to a private file (passed with --env-file, deleted with the
@@ -247,9 +244,7 @@ class Drill:
             return None, "probe returned unreadable output: " + self.redact(r.out[:300])
 
     def resolve_env(self) -> dict[str, str]:
-        db = self.d["database"]
-        values = {"db.host": self.db_name, "db.port": "5432", "db.user": db["user"],
-                  "db.password": self.db_password, "db.name": db["name"]}
+        values = self.engine.env_values(self, self.d["database"])
         values.update({f"secret.{k}": v for k, v in self.secret_values.items()})
         out = {}
         for key, template in self.d["service"]["env"].items():
@@ -321,7 +316,7 @@ class Drill:
                     raise Blocked(f"not enough free disk for {f['name']}: need {need / 1e9:.1f} GB, have {free / 1e9:.1f} GB")
 
         # Images (never pulled implicitly: a drill does not reach the network on its own)
-        for image in (db["image"], self.d["service"]["image"], PROBE_IMAGE):
+        for image in dict.fromkeys((db["image"], self.d["service"]["image"], PROBE_IMAGE)):
             info = self.docker.image_info(image)
             if info is None:
                 raise Blocked(f"image '{image}' is not present locally. Pull or build it first "
@@ -368,24 +363,11 @@ class Drill:
         if "database" in self.failed_artifacts or not path.is_file():
             return
         started = self.clock.elapsed()
-        name = path.name.lower()
         try:
-            if name.endswith(".gz"):
-                total = 0
-                with gzip.open(path, "rb") as fh:
-                    while chunk := fh.read(1 << 20):
-                        total += len(chunk)
-                detail = f"gzip stream is complete ({total:,} bytes of SQL)"
-            elif name.endswith((".dump", ".pgdump")):
-                with open(path, "rb") as fh:
-                    if fh.read(5) != b"PGDMP":
-                        raise ValueError("not a pg_dump custom-format archive (missing PGDMP header)")
-                detail = "pg_dump custom-format header present"
-            else:
-                detail = "plain SQL file"
+            detail = self.engine.check_format(path)
             self.record("PREFLIGHT", "database dump format is readable", PASS, detail, kind="artifact",
                         started=started)
-        except (OSError, EOFError, ValueError, gzip.BadGzipFile) as exc:
+        except (OSError, EOFError, ValueError) as exc:
             self.failed_artifacts.add("database")
             self.record("PREFLIGHT", "database dump format is readable", FAIL, f"corrupt dump: {exc}",
                         kind="artifact", started=started)
@@ -405,71 +387,57 @@ class Drill:
     def restore_database(self) -> bool:
         self.stage("RESTORING")
         db = self.d["database"]
+        eng = self.engine
         started = self.clock.elapsed()
         if "database" in self.failed_artifacts:
             self.record("RESTORING", "database restored from backup", FAIL,
                         "not attempted: the database artifact failed preflight", kind="data", started=started)
             return False
-        envf = self.env_file("db", {"POSTGRES_PASSWORD": self.db_password, "POSTGRES_USER": db["user"],
-                                    "POSTGRES_DB": db["name"]})
-        r = self.dk(["run", "-d", "--name", self.db_name, "--network", self.net, *self.labels(),
-                     "--memory", self.d["limits"]["db_memory"], "--pids-limit", "256",
-                     "--security-opt", "no-new-privileges", "--env-file", str(envf), db["image"]], timeout=120)
+        args = ["run", "-d", "--name", self.db_name, "--network", self.net, *self.labels(),
+                "--memory", self.d["limits"]["db_memory"], "--pids-limit", "256",
+                "--security-opt", "no-new-privileges"]
+        env = eng.container_env(db, self.db_password)
+        if env:
+            args += ["--env-file", str(self.env_file("db", env))]
+        r = self.dk(args + [db["image"], *eng.container_command(int(self.d["limits"]["timeout"]) + 60)],
+                    timeout=120)
         if not r.ok:
             self.record("RESTORING", "temporary database started", FAIL, self.redact(r.err.strip()[:400]),
                         kind="data", started=started)
             return False
         self.resource("started", "container", "database", self.db_name, db["image"])
-        ready = False
-        deadline = time.monotonic() + 90
-        while time.monotonic() < deadline:
-            # TCP readiness only succeeds after the image's init phase (its temporary server is socket-only).
-            if self.dk(["exec", self.db_name, "pg_isready", "-q", "-h", "127.0.0.1", "-U", db["user"]],
-                       timeout=10).ok:
-                ready = True
-                break
-            time.sleep(0.5)
-        if not ready:
-            logs = self.dk(["logs", "--tail", "30", self.db_name], timeout=20)
-            self.record("RESTORING", "temporary database started", FAIL, "database did not become ready in 90s",
-                        kind="data", started=started, evidence={"logs": self.redact(tail(logs.out + logs.err))})
-            return False
-
-        art = self.recovery_dir / db["artifact"]
-        name = art.name.lower()
-        if name.endswith(".gz"):
-            cmd = ["exec", "-i", self.db_name, "sh", "-c",
-                   f"gunzip -c | psql -X -q -v ON_ERROR_STOP=1 -U {db['user']} -d {db['name']}"]
-            r = self.dk(cmd, timeout=self.d["limits"]["timeout"], stdin_file=art)
-        elif name.endswith(".sql"):
-            cmd = ["exec", "-i", self.db_name, "psql", "-X", "-q", "-v", "ON_ERROR_STOP=1",
-                   "-U", db["user"], "-d", db["name"]]
-            r = self.dk(cmd, timeout=self.d["limits"]["timeout"], stdin_file=art)
-        else:
-            cp = self.dk(["cp", str(art), f"{self.db_name}:/tmp/restore.dump"], timeout=300)
-            if not cp.ok:
-                self.record("RESTORING", "database restored from backup", FAIL, cp.err.strip()[:400],
-                            kind="data", started=started)
+        ready_cmd = eng.ready_command(db)
+        if ready_cmd:
+            ready = False
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                if self.dk(["exec", self.db_name, *ready_cmd], timeout=15).ok:
+                    ready = True
+                    break
+                time.sleep(0.5)
+            if not ready:
+                logs = self.dk(["logs", "--tail", "30", self.db_name], timeout=20)
+                self.record("RESTORING", "temporary database started", FAIL,
+                            f"{eng.label} did not become ready in 120s", kind="data", started=started,
+                            evidence={"logs": self.redact(tail(logs.out + logs.err))})
                 return False
-            r = self.dk(["exec", self.db_name, "pg_restore", "--no-owner", "--no-privileges", "--exit-on-error",
-                         "-U", db["user"], "-d", db["name"], "/tmp/restore.dump"], timeout=self.d["limits"]["timeout"])
+
+        r = eng.restore(self, db, self.recovery_dir / db["artifact"])
         if not r.ok:
             self.record("RESTORING", "database restored from backup", FAIL,
                         "restore failed: " + self.redact(tail(r.err or r.out, 6, 600)), kind="data",
                         started=started, evidence={"stderr": self.redact(tail(r.err, 40))})
             return False
-        tables = self.psql(
-            "select table_name from information_schema.tables where table_schema = 'public' "
-            "and table_type = 'BASE TABLE' order by 1")
-        counts = {}
-        for t in [x for x in tables.out.split("\n") if x][:60]:
-            c = self.psql(f'select count(*) from public."{t}"')
-            counts[t] = int(c.out.strip()) if c.ok and c.out.strip().isdigit() else None
+        counts = eng.inventory(self, db)
         total = sum(v for v in counts.values() if v)
-        self.emit("restored", what="database", tables=len(counts), rows=total)
+        groups, items = eng.units
+        self.emit("restored", what="database", tables=len(counts), rows=total, units=[groups, items])
+        where = (f"restored into a fresh {eng.label}" if eng.server
+                 else "restored; the file passed SQLite's integrity check")
         self.record("RESTORING", "database restored from backup", PASS,
-                    f"{len(counts)} tables, {total:,} rows restored into a fresh PostgreSQL",
-                    kind="data", started=started, evidence={"tables": counts, "image": db["image"]})
+                    f"{len(counts)} {groups}, {total:,} {items} {where}",
+                    kind="data", started=started,
+                    evidence={"tables": counts, "image": db["image"], "engine": eng.key})
         return True
 
     def scratch_dest(self, name: str) -> Path | None:
@@ -531,6 +499,11 @@ class Drill:
                     self.record("STARTING", f"{f['name']} mounted into the app", FAIL, cp.err.strip()[:400],
                                 kind="files", started=started)
                     return False
+        handed = self.engine.deliver(self, self.d["database"])
+        if handed is not None and not handed.ok:
+            self.record("STARTING", "database file placed in the app", FAIL, handed.err.strip()[:400],
+                        kind="data", started=started)
+            return False
         r = self.dk(["start", self.app_name], timeout=60)
         if not r.ok:
             self.record("STARTING", "application started", FAIL, self.redact(r.err.strip()[:400]),
@@ -569,7 +542,7 @@ class Drill:
                 self.record("VALIDATING", chk["name"], SKIP, "not evaluated: database did not restore",
                             kind="data", mandatory=chk["mandatory"])
                 continue
-            r = self.psql(chk["sql"])
+            r = self.query(chk["sql"])
             if not r.ok:
                 self.record("VALIDATING", chk["name"], FAIL, "query failed: " + tail(r.err, 3, 300),
                             kind="data", mandatory=chk["mandatory"], started=started, evidence={"sql": chk["sql"]})
@@ -588,7 +561,7 @@ class Drill:
                             "not evaluated: " + ("database" if not db_ok else chk["files"]) + " did not restore",
                             kind="reference", mandatory=chk["mandatory"])
                 continue
-            r = self.psql(chk["sql"], timeout=300)
+            r = self.query(chk["sql"], timeout=300)
             if not r.ok:
                 self.record("VALIDATING", chk["name"], FAIL, "query failed: " + tail(r.err, 3, 300),
                             kind="reference", mandatory=chk["mandatory"], started=started)
@@ -696,7 +669,7 @@ class Drill:
         out["rpo_seconds"] = None
         out["rpo_basis"] = "unknown: no rpo_watermark_sql declared"
         if obj["rpo_watermark_sql"] and db_ok:
-            r = self.psql(obj["rpo_watermark_sql"])
+            r = self.query(obj["rpo_watermark_sql"])
             wm = parse_time(r.out.strip().split(SEP)[0]) if r.ok and r.out.strip() else None
             incident = parse_time(obj["incident_time"]) if obj["incident_time"] else self.started
             src = "declared incident_time" if obj["incident_time"] else "drill start time"

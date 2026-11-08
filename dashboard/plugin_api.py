@@ -6,6 +6,7 @@ plugin's own data directory; nothing here can start a drill or touch Docker.
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import re
@@ -113,11 +114,28 @@ def events(run_id: str, since: int = 0):
 
 @router.get("/runs/{run_id}/report")
 def report_html(run_id: str):
-    _, store = _engine()
+    report, store = _engine()
     ev = store.load_evidence(_home(), _check_id(run_id))
     if not ev:
         raise HTTPException(status_code=404, detail="no such run")
     path = Path(ev["reports"]["html"])
     if not path.is_file():
         raise HTTPException(status_code=404, detail="report file is missing")
-    return {"run_id": ev["run_id"], "path": str(path), "html": path.read_text(encoding="utf-8")}
+    # Render from the evidence with the current design, so runs saved by older versions read the
+    # same way. The digest shown is the one recorded next to the evidence file at the time.
+    digest_file = path.with_name("evidence.sha256")
+    digest = digest_file.read_text(encoding="utf-8").split()[0] if digest_file.is_file() else ""
+    try:
+        html = report.render_html(ev, digest)
+    except Exception:
+        html = path.read_text(encoding="utf-8")
+    return {"run_id": ev["run_id"], "path": str(path), "html": html}
+
+
+@router.get("/art")
+def art():
+    """The halftone Hermes emblem the drill view shows in its header (the report's masthead image)."""
+    path = Path(__file__).resolve().parents[1] / "engine" / "report_art.jpg"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="no art")
+    return {"jpeg": base64.b64encode(path.read_bytes()).decode("ascii")}

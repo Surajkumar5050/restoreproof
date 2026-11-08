@@ -8,6 +8,7 @@ Courier Prime for prose, JetBrains Mono for data.
 
 from __future__ import annotations
 
+import base64
 import functools
 import html
 import json
@@ -31,12 +32,21 @@ def failed_mandatory(ev: dict) -> list[dict]:
     return [c for c in ev["checks"] if c["mandatory"] and c["status"] in ("FAIL", "ERROR")]
 
 
+STATUS = {"PASS": "Recoverable", "PARTIAL": "Not fully recoverable", "FAIL": "Not recoverable",
+          "BLOCKED": "The drill did not run", "INCONCLUSIVE": "No verdict"}
+
+
+def status_phrase(verdict: str) -> str:
+    """The verdict in words a person uses."""
+    return STATUS.get(verdict, verdict.title())
+
+
 def headline(ev: dict) -> str:
     """One plain sentence a non-engineer can act on. Built only from recorded facts."""
     v = ev["verdict"]
     failed = failed_mandatory(ev)
     if v == "PASS":
-        return "Everything this contract requires came back: the data, the files and the customer journey."
+        return "Everything came back: the data, the files and the customer journey all work."
     if v == "BLOCKED":
         return f"The drill did not run: {ev['verdict_reason']}."
     if v == "INCONCLUSIVE":
@@ -44,22 +54,58 @@ def headline(ev: dict) -> str:
     ref = next((c for c in failed if c["kind"] == "reference"), None)
     journey = next((c for c in failed if c["kind"] == "journey"), None)
     if v == "PARTIAL":
-        if ref:
+        if ref and ref.get("evidence", {}).get("references"):
             e = ref["evidence"]
-            impact = f"{e['missing']:,} of {e['references']:,} files its database points to are gone"
-        elif journey:
-            impact = f"“{journey['name']}” fails"
-        else:
-            impact = f"“{failed[0]['name']}” fails" if failed else "a mandatory check fails"
-        return f"The app boots, but the business does not fully come back: {impact}."
+            return (f"The app comes back, but {e['missing']:,} of the {e['references']:,} files it needs "
+                    f"are missing from the backup.")
+        if journey:
+            return f"The app comes back, but a customer step fails: {journey['name']}."
+        return f"The app comes back, but {failed[0]['name'] if failed else 'a required check'} fails."
     first = failed[0] if failed else None
     if first and first["stage"] == "PREFLIGHT":
-        return f"This backup set cannot rebuild the app: {first['summary']}."
+        return f"This backup can't rebuild the app: {first['summary']}."
     if first and first["stage"] == "STARTING":
-        return "The data restores, but the application does not start from it."
+        return "The data restores, but the app doesn't start from it."
     if first:
-        return f"This backup cannot rebuild the app: {first['name']} failed."
-    return f"This backup cannot rebuild the app: {ev['verdict_reason']}."
+        return f"This backup can't rebuild the app: {first['name']} failed."
+    return f"This backup can't rebuild the app: {ev['verdict_reason']}."
+
+
+def next_step(ev: dict) -> str | None:
+    """The one thing to do next, from recorded facts only. Inferences are worded as likely, never certain."""
+    v = ev["verdict"]
+    if v == "PASS":
+        return None
+    if v == "BLOCKED":
+        return f"{_sentence(ev['verdict_reason'])} Fix that, then run the drill again. Nothing was started."
+    if v == "INCONCLUSIVE":
+        return "Run the drill again. If it repeats, the technical details below show where it stopped."
+    failed = failed_mandatory(ev)
+    ref = next((c for c in failed if c["kind"] == "reference"), None)
+    if ref:
+        folders = [f for f, _ in (ref.get("evidence", {}).get("missing_by_folder") or [])]
+        if len(folders) == 1:
+            return (f"Every missing file is in {folders[0]}/. Your backup job is likely skipping that folder: "
+                    f"check its include and exclude rules, then run this drill again.")
+        if folders:
+            return (f"Files are missing from {len(folders)} folders, most from {folders[0]}/. Check which "
+                    f"folders your backup job includes, then run this drill again.")
+    first = failed[0] if failed else None
+    if first and first["stage"] == "PREFLIGHT":
+        return f"{_sentence(first['summary'])} Take a fresh backup, then run this drill again."
+    if first and first["stage"] == "STARTING":
+        return ("The app doesn't start on the restored data. Its last log lines are under technical details; "
+                "a missing setting or an incompatible schema are the usual causes.")
+    journey = next((c for c in failed if c["kind"] == "journey"), None)
+    if journey:
+        steps = (journey.get("evidence") or {}).get("steps") or []
+        bad = next((s for s in steps if not s.get("ok")), None)
+        if bad:
+            return (f"A customer request fails: {bad.get('method', '')} {bad.get('path', '')} returns "
+                    f"{bad.get('status', 'no answer')}. Check that the backup holds what that request needs.")
+    if first:
+        return f"{_sentence(first['summary'])} Fix that, then run this drill again."
+    return None
 
 
 def objective_lines(ev: dict) -> list[str]:
@@ -199,7 +245,7 @@ def card(ev: dict) -> dict:
     cl = ev.get("cleanup") or {}
     return {
         "run_id": ev["run_id"], "app": ev["app"], "verdict": ev["verdict"], "headline": headline(ev),
-        "reason": ev["verdict_reason"], "started_at": ev.get("started_at"), "trigger": ev.get("trigger"),
+        "status": status_phrase(ev["verdict"]), "next_step": next_step(ev), "reason": ev["verdict_reason"], "started_at": ev.get("started_at"), "trigger": ev.get("trigger"),
         "recovery_point": (ev.get("recovery_point") or {}).get("label"),
         "claimed": {"status": claimed.get("status"), "finished_at": claimed.get("finished_at")}
         if claimed.get("status") else None,
@@ -361,142 +407,6 @@ def _file_strip(e: dict, uid: str) -> str:
             f' · <span class="bad">{e["missing"]:,} missing</span>, {shape}.</figcaption></figure>')
 
 
-def _finding(c: dict, missing_paths: set[str]) -> str:
-    e = c.get("evidence") or {}
-    title, body, note = _cap(c["name"]) + ".", "", ""
-    assertion = ""
-    if c["kind"] == "reference" and e.get("references"):
-        folders = e.get("missing_by_folder") or []
-        where = ", all from one folder" if len(folders) == 1 else (
-            f", across {len(folders)} folders" if len(folders) < 10 else ", across many folders")
-        title = f"{e['missing']:,} of {e['references']:,} referenced files are missing{where}."
-        assertion = c["name"]
-        frows = "".join(f'<tr><td>{_e(f)}/</td><td class="r bad">{n:,}</td></tr>' for f, n in folders[:6])
-        if len(folders) < 10:
-            frows += '<tr><td class="m">every other folder</td><td class="r m">0</td></tr>'
-        sample = e.get("missing_sample") or []
-        shown = sample[:6]
-        rrows = "".join(f'<tr><td class="nw">{_e(m["key"])}</td><td class="m nw">{_e(m["path"])}</td></tr>'
-                        for m in shown)
-        rest = e["missing"] - len(shown)
-        if rest > 0:
-            where_rest = ("listed in evidence.json" if e["missing"] <= len(sample)
-                          else f"evidence.json lists the first {len(sample)}")
-            rrows += f'<tr><td colspan="2" class="m">and {rest:,} more, {where_rest}</td></tr>'
-        body = (_file_strip(e, c.get("id") or "x")
-                + f'<div class="pair"><div class="wrap"><table class="tb"><thead><tr><th>Folder</th>'
-                  f'<th class="r">Missing</th></tr></thead><tbody>{frows}</tbody></table></div>'
-                  f'<div class="wrap"><table class="tb"><thead><tr><th>Record</th><th>Expected file</th></tr></thead>'
-                  f'<tbody>{rrows}</tbody></table></div></div>')
-    elif c["kind"] == "journey" and e.get("steps"):
-        rows = ""
-        for i, s in enumerate(e["steps"], 1):
-            checks = s.get("checks", [])
-            good = sum(1 for k in checks if k["ok"])
-            ok = bool(s.get("ok"))
-            ctype = (s.get("content_type") or "").split(";")[0]
-            status = s.get("status")
-            rows += (f'<tr><td class="m">{i}</td><td>{_e(s.get("method"))} {_e(s.get("path"))}</td>'
-                     f'<td class="r{"" if ok else " bad"}">{_e(status if status is not None else "no reply")}</td>'
-                     f'<td class="m">{_e(ctype)}</td>'
-                     f'<td class="r {"ok" if ok else "bad"}">{"✓" if ok else "✗"} {good} of {len(checks)}</td></tr>')
-            misses = [k for k in checks if not k["ok"]]
-            if misses:
-                lines = "<br>".join(f'expected {_e(k["check"])}'
-                                    + (f' <span class="m">{_e(k["detail"])}</span>' if k.get("detail") else "")
-                                    for k in misses)
-                rows += f'<tr class="why"><td></td><td colspan="4">{lines}</td></tr>'
-            path = str(s.get("path") or "")
-            if not ok and any(path.endswith("/" + p) for p in missing_paths):
-                note = " The file it asks for is one of the missing files above."
-        body = (f'<div class="inset wrap"><table class="tb journey"><thead><tr><th>#</th>'
-                f'<th>Request</th><th class="r">Status</th><th>Type</th><th class="r">Checks</th></tr></thead>'
-                f'<tbody>{rows}</tbody></table></div>')
-    elif c["kind"] == "data" and "value" in e:
-        body = (f'<div class="inset"><code>{_e(e.get("sql"))}</code><p>returned <b>{_e(e.get("value"))}</b>, '
-                f'expected {_e(json.dumps(e.get("expect")))}</p></div>')
-    elif e.get("logs"):
-        body = f'<pre class="inset logs">{_e(e["logs"])}</pre>'
-    sub = f'<span class="assert">Assertion: {_e(assertion)}</span>' if assertion else ""
-    return (f'<article class="finding"><div class="fh"><span class="g bad">{GLYPH.get(c["status"], "!")}</span>'
-            f'<div><h3>{_e(title)}</h3>{sub}</div></div><p class="fs">{_e(_sentence(c["summary"]))}{_e(note)}</p>'
-            f'{body}</article>')
-
-
-def _objectives(ev: dict, n_mand: int, n_pass: int, n_fail: int, n_skip: int) -> str:
-    cl = ev.get("cleanup") or {}
-
-    def row(name, measured, target, result, cls):
-        return (f'<tr><td class="name">{_e(name)}</td><td class="r">{_e(measured)}</td>'
-                f'<td class="r m">{_e(target)}</td><td class="{cls}">{_e(result)}</td></tr>')
-
-    tone_cls = {"ok": "ok", "warn": "warn", "bad": "bad", "muted": "m"}
-    rows = "".join(row(n, m, t, r, tone_cls[tone]) for n, m, t, r, tone in objective_rows(ev))
-
-    if n_fail:
-        res, cls = f"{n_fail} failed", "bad"
-    elif n_skip:
-        res, cls = f"{n_skip} not evaluated", "m"
-    else:
-        res, cls = "all passed", "ok"
-    rows += row("Mandatory checks", f"{n_pass} of {n_mand}", f"{n_mand} of {n_mand}", res, cls)
-
-    left = sum(len(x) for x in (cl.get("residual") or {}).values())
-    if cl.get("ok"):
-        res, cls = f"met · {cl.get('removed', 0)} temporary resources removed", "ok"
-    else:
-        res, cls = f"{left} still present · run hermes restoreproof cleanup", "bad"
-    rows += row("Left behind after cleanup", str(left), "0", res, cls)
-    return rows
-
-
-def _timeline(ev: dict) -> str:
-    states = stage_states(ev)
-    total = ev.get("total_seconds") or sum(s["seconds"] or 0 for s in states)
-    if not total or not any(s["seconds"] for s in states):
-        return '<p class="m">No stage ran long enough to time.</p>'
-    starts = {}
-    for s in ev.get("stages", []):
-        starts.setdefault(STAGE_LABEL.get(s["stage"], s["stage"]), s.get("started"))
-    segs = ""
-    for s in states:
-        if not s["seconds"]:
-            continue
-        cls = {"fail": "bad", "skip": "skip"}.get(s["state"], "after" if s["label"] == "Clean up" else "done")
-        segs += f'<span class="{cls}" style="flex:{s["seconds"]:.3f}" title="{_e(s["label"])} {_e(human_duration(s["seconds"]))}"></span>'
-    o = ev.get("objectives") or {}
-    rec = o.get("measured_recovery_seconds")
-    bracket = ""
-    if rec and rec <= total:
-        bracket = (f'<div class="bracket"><span style="flex:{rec:.3f}">recovery time {_e(human_duration(rec))}, '
-                   f'until the last mandatory check</span><span class="r" style="flex:{max(total - rec, 0.001):.3f}">'
-                   f'{_e(human_duration(total))}</span></div>')
-    aria = "; ".join(f"{s['label']} {human_duration(s['seconds'])}" for s in states if s["seconds"])
-    rows = ""
-    for key, label in STAGES:
-        s = next(x for x in states if x["label"] == label)
-        if key == "CLEANING":
-            cl = ev.get("cleanup") or {}
-            left = sum(len(x) for x in (cl.get("residual") or {}).values())
-            res = (f'<span class="ok">✓</span> {cl.get("removed", 0)} removed, 0 left' if cl.get("ok")
-                   else f'<span class="bad">✗</span> {left} left behind')
-        else:
-            items = [c for c in ev["checks"] if c["stage"] == key and c["mandatory"]]
-            good = sum(1 for c in items if c["status"] == "PASS")
-            glyph = {"pass": '<span class="ok">✓</span>', "fail": '<span class="bad">✗</span>',
-                     "skip": '<span class="m">–</span>'}.get(s["state"], '<span class="m">·</span>')
-            res = f"{glyph} {good} of {len(items)} passed" if items else '<span class="m">—</span>'
-        at = starts.get(label)
-        rows += (f'<tr><td class="name">{_e(label)}</td><td class="r m">{_e(f"{at:.1f}s" if at is not None else "—")}</td>'
-                 f'<td class="r">{_e(human_duration(s["seconds"]) if s["seconds"] is not None else "—")}</td>'
-                 f'<td>{res}</td></tr>')
-    return (f'<div class="bar" role="img" aria-label="Stage durations to scale: {_e(aria)}">{segs}</div>{bracket}'
-            f'<div class="wrap"><table class="tb" style="min-width:520px"><thead><tr><th>Stage</th>'
-            f'<th class="r">Starts at</th><th class="r">Took</th><th>Result</th></tr></thead><tbody>{rows}</tbody>'
-            f'</table></div>')
-
-
-@functools.lru_cache(maxsize=1)
 def _fonts() -> str:
     """Embedded Courier Prime and JetBrains Mono subsets (see scripts/build_report_fonts.py).
 
@@ -507,97 +417,243 @@ def _fonts() -> str:
         return ""
 
 
+PLAIN_STAGE = {"PREFLIGHT": "Check the backup", "PROVISIONING": "Seal a sandbox", "RESTORING": "Restore",
+               "STARTING": "Start the app", "VALIDATING": "Try it as a customer", "CLEANING": "Clean up"}
+
+
+def _say(seconds) -> str:
+    """Durations the way people say them: '17 seconds', '4 minutes', '14 hours'."""
+    if seconds is None:
+        return "unknown"
+    s = float(seconds)
+    if s < 1:
+        return "under a second"
+    for limit, unit, size in ((60, "second", 1), (3600, "minute", 60), (172800, "hour", 3600)):
+        if s < limit:
+            n = round(s / size)
+            return f"{n} {unit}{'' if n == 1 else 's'}"
+    n = round(s / 86400)
+    return f"{n} day{'' if n == 1 else 's'}"
+
+
+def _art() -> str:
+    """The halftone Hermes masthead (engine/report_art.jpg, built by scripts/build_halftone_art.py), base64."""
+    try:
+        return base64.b64encode(Path(__file__).with_name("report_art.jpg").read_bytes()).decode("ascii")
+    except OSError:
+        return ""
+
+
 def _css() -> str:
     dark, light = css_vars(palette.DARK), css_vars(palette.LIGHT)
     return f"""
-:root{{{dark};--display:"RP Courier Prime","Courier Prime","RP JetBrains Mono","Courier New",Courier,monospace;
-  --mono:"RP JetBrains Mono","JetBrains Mono","Cascadia Mono",Consolas,"DejaVu Sans Mono",ui-monospace,monospace;
-  color-scheme:dark}}
-@media (prefers-color-scheme:light){{:root{{{light};color-scheme:light}}}}
+:root{{{dark};--display:"RP Courier Prime","Courier New",monospace;--mono:"RP JetBrains Mono",ui-monospace,monospace;
+--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}}
+@media (prefers-color-scheme:light){{:root{{{light}}}}}
 *{{box-sizing:border-box}}
 html{{background:var(--ground)}}
-body{{margin:0;color:var(--ink);font:17px/1.6 var(--display);-webkit-font-smoothing:antialiased}}
-.page{{max-width:1040px;margin:0 auto;padding:40px 24px 72px;display:flex;flex-direction:column;gap:52px}}
-code,.mono{{font:13px/1.6 var(--mono)}}
-code{{overflow-wrap:anywhere}}
-.m{{color:var(--muted)}}.ink{{color:var(--ink)}}.ok{{color:var(--ok)}}.warn{{color:var(--warn)}}.bad{{color:var(--err)}}
-.r{{text-align:right}}
-.top{{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px 24px;
-  border-bottom:1px solid var(--bronze);padding-bottom:14px}}
-.mark{{font:700 15px/1 var(--display);letter-spacing:.22em;color:var(--gold)}}
-.mark span{{letter-spacing:0;font-weight:400;color:var(--muted);margin-left:8px}}
-.top .meta{{font:13px var(--mono);color:var(--muted)}}
-.case{{display:flex;flex-direction:row;flex-wrap:wrap;justify-content:space-between;align-items:flex-start;gap:28px}}
-.who{{flex:999 1 520px;min-width:0;display:flex;flex-direction:column;gap:12px}}
-h1{{margin:0;font:700 56px/1.05 var(--display);overflow-wrap:anywhere}}
-.who p{{margin:0}}.desc{{color:var(--ink-2)}}
-.kv{{font:13px/1.8 var(--mono);color:var(--muted)}}.kv b{{font-weight:400;color:var(--ink);margin-right:18px;white-space:nowrap}}
-.verdict{{flex:0 0 auto;border:2px solid var(--v);padding:14px 24px 12px;display:flex;flex-direction:column;gap:4px}}
-.vw{{font:700 44px/1 var(--display);letter-spacing:.08em;color:var(--v)}}
-.vn{{font:12px var(--mono);color:var(--ink-2)}}
-.headline{{margin:-20px 0 0;font:700 30px/1.3 var(--display);max-width:32ch}}
-.claim{{display:flex;flex-direction:row;gap:0;flex-wrap:wrap;border-top:1px solid var(--rule);border-bottom:1px solid var(--rule)}}
-.claim>div{{flex:1 1 300px;padding:22px 28px 22px 0;display:flex;flex-direction:column;gap:6px}}
-.claim>div+div{{padding:22px 0 22px 28px;border-left:1px solid var(--rule)}}
-.lbl{{font:500 12px/1.4 var(--mono);color:var(--muted)}}
-.said{{font:400 36px/1.1 var(--display)}}.found{{font:700 36px/1.1 var(--display);color:var(--v)}}
-.when{{font:13px var(--mono);color:var(--muted)}}
-section{{display:flex;flex-direction:column;gap:16px}}
-h2{{margin:0;font:700 22px/1.3 var(--display);break-after:avoid}}
-h2 .n{{color:var(--label);font:600 15px var(--mono);margin-right:14px}}
-.wrap{{overflow-x:auto}}
-.tb{{border-collapse:collapse;width:100%}}
-.tb th{{text-align:left;font:500 12px/1.4 var(--mono);color:var(--muted);padding:0 14px 8px 0;border-bottom:1px solid var(--rule-2)}}
-.tb td{{padding:9px 14px 9px 0;border-bottom:1px solid var(--rule);vertical-align:top;font:13px/1.55 var(--mono);
-  font-variant-numeric:tabular-nums;overflow-wrap:anywhere}}
-.tb th:last-child,.tb td:last-child{{padding-right:0}}
-.tb td.r,.tb th.r,.tb td.nw{{white-space:nowrap;overflow-wrap:normal}}
-.tb td.name{{font:16px/1.5 var(--display)}}
-.tb .adv{{color:var(--muted);margin-left:8px}}
-.tb tr.why td{{color:var(--ink-2);border-bottom:0}}
-.journey{{min-width:680px}}.journey td{{overflow-wrap:normal}}
-.finding{{display:flex;flex-direction:column;gap:18px}}
-.finding+.finding{{border-top:1px solid var(--rule);padding-top:26px}}
-.fh{{display:flex;gap:14px;align-items:baseline}}
-.fh .g{{font:700 18px var(--mono)}}
-.fh>div{{display:flex;flex-direction:column;gap:4px}}
-h3{{margin:0;font:700 22px/1.3 var(--display)}}
-.assert{{font:13px var(--mono);color:var(--muted)}}
-.fs,.finding>.strip,.finding>.pair,.finding>.inset{{margin:0 0 0 32px}}
-.fs{{color:var(--ink-2)}}
-.inset{{background:var(--inset);padding:16px 18px}}
-.inset p{{margin:6px 0 0;font:13px var(--mono);color:var(--ink-2)}}
-.logs{{max-height:260px;overflow:auto;white-space:pre-wrap;font:12px/1.6 var(--mono);color:var(--ink-2)}}
-.strip{{display:flex;flex-direction:column;gap:8px}}
-.files{{display:block;width:100%;height:auto;-webkit-print-color-adjust:exact;print-color-adjust:exact}}
-.ends{{display:flex;justify-content:space-between;gap:16px;font:12px var(--mono);color:var(--muted);overflow-wrap:anywhere}}
-.strip figcaption{{font:12px/1.6 var(--mono);color:var(--muted)}}
-.pair{{display:flex;flex-wrap:wrap;gap:32px}}.pair>div{{flex:1 1 300px;min-width:0}}
-.none{{margin:0;color:var(--ink-2)}}
-.bar{{display:flex;height:14px;gap:2px;-webkit-print-color-adjust:exact;print-color-adjust:exact}}
-.bar span{{min-width:2px}}.bar .done{{background:var(--muted)}}.bar .after{{background:var(--rule-2)}}
-.bar .bad{{background:var(--err)}}.bar .skip{{background:transparent;border:1px dashed var(--rule-2)}}
-.bracket{{display:flex;font:12px var(--mono);color:var(--muted);margin-top:-8px}}
-.bracket span:first-child{{border-top:1px solid var(--muted);padding-top:6px}}.bracket span{{padding-top:7px}}
-dl{{margin:8px 0 0;display:grid;grid-template-columns:minmax(0,160px) minmax(0,1fr);gap:12px 24px;font-size:16px}}
-dt{{padding-top:3px}}dd{{margin:0;color:var(--ink-2);display:flex;flex-direction:column;gap:6px}}
-dd code.cmd{{background:var(--inset);padding:8px 12px;align-self:flex-start}}
-footer{{display:flex;flex-wrap:wrap;justify-content:space-between;gap:10px 24px;border-top:1px solid var(--bronze);
-  padding-top:16px;font:12px/1.7 var(--mono);color:var(--muted)}}
-@media (max-width:640px){{
-  .page{{gap:40px;padding-top:28px}}h1{{font-size:38px}}.vw{{font-size:34px}}
-  .headline{{font-size:23px;margin-top:-12px}}.said,.found{{font-size:28px}}
-  .claim>div+div{{border-left:0;border-top:1px solid var(--rule);padding-left:0}}
-  .fs,.finding>.strip,.finding>.pair,.finding>.inset{{margin-left:0}}
-  dl{{grid-template-columns:1fr;gap:4px}}dd{{margin-bottom:12px}}
-}}
-@media print{{
-  :root{{{light}}}
-  html,body{{background:none}}.page{{padding:0;gap:36px;max-width:none}}
-  .finding,.tb tr,dl,.case,.claim{{break-inside:avoid}}
-  .wrap{{overflow:visible}}a{{color:inherit}}
-}}
+body{{margin:0;color:var(--ink);font:16px/1.6 var(--sans);-webkit-font-smoothing:antialiased}}
+.page{{max-width:780px;margin:0 auto;padding:0 24px 64px}}
+.mast{{display:flex;height:150px;margin:0 -24px;background:var(--hb-ground);overflow:hidden}}
+.mast .in{{flex:1;display:flex;flex-direction:column;justify-content:flex-end;padding:0 24px 18px;min-width:0}}
+.mast img{{flex:none;height:150px;width:auto;display:block}}
+.mark{{font:700 13px/1 var(--display);letter-spacing:.32em;color:var(--hb-ink)}}
+.meta{{display:block;font:12px var(--mono);color:var(--hb-ink-2);margin-top:8px}}
+.app{{margin-top:28px;font:14px var(--mono);color:var(--muted)}}
+.status{{display:flex;align-items:center;gap:10px;margin-top:6px}}
+.dot{{width:10px;height:10px;border-radius:50%;background:var(--v)}}
+.phrase{{font-weight:600;color:var(--v)}}
+.vw{{font:12px var(--mono);letter-spacing:.08em;color:var(--muted);border:1px solid var(--rule-2);padding:1px 6px;border-radius:4px}}
+h1{{font:700 30px/1.3 var(--display);margin:12px 0 0;letter-spacing:-.01em}}
+.lead{{color:var(--ink-2);margin:14px 0 0}}
+.said{{font-family:var(--mono)}}
+.nums{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:32px}}
+.num{{background:var(--inset);border-radius:8px;padding:14px 16px}}
+.nl{{font-size:13px;color:var(--muted)}}
+.nv{{font:700 22px/1.3 var(--display);margin-top:2px}}
+.nn{{font-size:12.5px;color:var(--muted);margin-top:2px}}
+.fix{{margin-top:24px;border:1px solid var(--v);border-radius:8px;padding:14px 16px}}
+.fix h2{{font:600 13px var(--sans);color:var(--v);margin:0;letter-spacing:.02em}}
+.fix p{{margin:6px 0 0}}
+.list{{list-style:none;margin:24px 0 0;padding:0}}
+.list li{{display:flex;gap:10px;padding:8px 0;border-bottom:1px solid var(--rule)}}
+.list li:last-child{{border-bottom:0}}
+.g{{font-family:var(--mono);font-weight:700;flex:none;width:14px}}
+.ok{{color:var(--ok)}}.bad{{color:var(--err)}}.mute{{color:var(--muted)}}
+.fact{{display:block;font:13px/1.5 var(--mono);color:var(--muted);overflow-wrap:anywhere}}
+.more{{margin-top:36px;border-top:1px solid var(--rule)}}
+details{{border-bottom:1px solid var(--rule)}}
+summary{{cursor:pointer;list-style:none;padding:14px 0;display:flex;gap:12px;font-weight:600}}
+summary::-webkit-details-marker{{display:none}}
+summary::after{{content:"+";font:400 18px/1 var(--mono);color:var(--muted)}}
+details[open] summary::after{{content:"\\2013"}}
+summary .s2{{font:400 13px var(--sans);color:var(--muted);margin-left:auto;padding-right:6px}}
+.body{{padding:0 0 18px}}
+.stage{{margin:14px 0 4px;font:600 13px var(--sans);color:var(--label)}}
+.body .list{{margin-top:0}}
+.strip{{margin:14px 0 0}}
+.files{{width:100%;height:auto;display:block}}
+.ends{{display:flex;justify-content:space-between;font:12px var(--mono);color:var(--muted);margin-top:6px}}
+figcaption{{font-size:13px;color:var(--muted);margin-top:6px}}
+.ink{{color:var(--ink)}}
+table{{width:100%;border-collapse:collapse;font-size:13.5px}}
+td{{padding:7px 8px 7px 0;border-bottom:1px solid var(--rule);vertical-align:top}}
+td.k{{color:var(--muted);width:34%}}
+code,.mono{{font:12.5px var(--mono);overflow-wrap:anywhere}}
+.verify{{font:12.5px var(--mono);background:var(--inset);border-radius:6px;padding:8px 10px;margin-top:8px;overflow-wrap:anywhere}}
+footer{{margin-top:40px;font-size:13px;color:var(--muted)}}
+@media (max-width:640px){{.nums{{grid-template-columns:1fr}}h1{{font-size:24px}}.page{{padding:0 16px 48px}}.mast{{margin:0 -16px}}.mast .in{{padding:0 16px 16px}}.mast img{{height:120px}}}}
+@media print{{html{{background:#fff}}}}
 """
+
+
+def _check_items(checks: list[dict]) -> str:
+    out = ""
+    for c in checks:
+        ok = c["status"] == "PASS"
+        glyph = GLYPH.get(c["status"], "!")
+        cls = "ok" if ok else ("mute" if c["status"] == "SKIPPED" else "bad")
+        note = "" if c["mandatory"] else " (advisory)"
+        out += (f'<li><span class="g {cls}">{glyph}</span><span>{_e(_cap(c["name"]))}{note}'
+                f'<span class="fact">{_e(c["summary"])}</span></span></li>')
+    return out
+
+
+def _how_we_know(ev: dict) -> str:
+    parts = ""
+    for key, _ in STAGES:
+        if key == "CLEANING":
+            cl = ev.get("cleanup") or {}
+            if not cl:
+                continue
+            ok = bool(cl.get("ok"))
+            text = (f"{cl.get('removed', 0)} temporary resources removed and checked gone; restored data deleted"
+                    if ok else f"Cleanup incomplete, still present: {cl.get('residual')}")
+            mark = '<span class="g ok">✓</span>' if ok else '<span class="g bad">✗</span>'
+            parts += (f'<div class="stage">{PLAIN_STAGE[key]}</div><ul class="list"><li>{mark}'
+                      f'<span>{_e(text)}</span></li></ul>')
+            continue
+        items = [c for c in ev["checks"] if c["stage"] == key]
+        if items:
+            parts += f'<div class="stage">{PLAIN_STAGE[key]}</div><ul class="list">{_check_items(items)}</ul>'
+    return parts
+
+
+def _files_section(ev: dict) -> tuple[str, set[str]]:
+    ref = next((c for c in ev["checks"] if c["kind"] == "reference" and c["status"] in ("FAIL", "ERROR")), None)
+    if not ref:
+        return "", set()
+    e = ref.get("evidence") or {}
+    if not e.get("references"):
+        return "", set()
+    sample = e.get("missing_sample") or []
+    missing_paths = {m["path"] for m in sample}
+    folders = "".join(f'<tr><td class="k"><code>{_e(f)}/</code></td><td><span class="bad">{n:,} missing</span></td></tr>'
+                      for f, n in (e.get("missing_by_folder") or [])[:8])
+    keys = ", ".join(_e(m["key"]) for m in sample[:12])
+    more = e["missing"] - min(12, len(sample))
+    records = ""
+    if keys:
+        records = (f'<p class="mute">Records affected: <span class="mono">{keys}</span>'
+                   + (f" and {more:,} more (all listed in evidence.json)" if more > 0 else "") + "</p>")
+    body = (f'<p>{e["missing"]:,} of {e["references"]:,} referenced files are missing. '
+            f'{_e(_sentence(ref["name"]))}</p>'
+            + _file_strip(e, "f")
+            + (f"<table>{folders}</table>" if folders else "")
+            + records)
+    return (f'<details><summary>Which files are missing<span class="s2">{e["missing"]:,}</span></summary>'
+            f'<div class="body">{body}</div></details>'), missing_paths
+
+
+def _journey_section(ev: dict, missing_paths: set[str]) -> str:
+    out = ""
+    for c in ev["checks"]:
+        steps = (c.get("evidence") or {}).get("steps") if c["kind"] == "journey" else None
+        if not steps:
+            continue
+        rows = ""
+        for st in steps:
+            ok = st.get("ok")
+            failed = "; ".join(x["check"] for x in st.get("checks", []) if not x.get("ok"))
+            hint = ""
+            path = str(st.get("path", "")).lstrip("/")
+            if not ok and any(path.endswith(m) for m in missing_paths):
+                hint = " The file it asks for is one of the missing files above."
+            mark = '<span class="g ok">✓</span>' if ok else '<span class="g bad">✗</span>'
+            fact = f'<span class="fact">expected {_e(failed)}.{_e(hint)}</span>' if failed else ""
+            rows += (f'<li>{mark}<span><span class="mono">{_e(st.get("method", ""))} {_e(st.get("path", ""))}</span>'
+                     f' answered {_e(st.get("status", "nothing"))}{fact}</span></li>')
+        out += (f'<details><summary>{_e(_cap(c["name"]))}<span class="s2">{len(steps)} requests</span></summary>'
+                f'<div class="body"><p class="mute">A test customer inside the sandbox made these requests '
+                f'to the restored app:</p><ul class="list">{rows}</ul></div></details>')
+    return out
+
+
+def _technical(ev: dict, file_sha: str) -> str:
+    o = ev.get("objectives") or {}
+    rows = [("Run", f'<code>{_e(ev["run_id"])}</code> · {_e(ev.get("trigger"))} · '
+                    f'{_e(str(ev.get("execution_status", "")).lower())}'),
+            ("Started", _e(_when(ev.get("started_at"))))]
+    for a in ev.get("artifacts", []):
+        if a.get("expected_sha256"):
+            match = ("matches the backup job's record" if a["expected_sha256"] == a["sha256"]
+                     else "does not match the backup job's record")
+        else:
+            match = "no recorded digest"
+        rows.append((_e(a["file"]), f'{a["bytes"]:,} bytes · <code>{_e(a["sha256"][:16])}…</code> · {match}'))
+    for i in ev.get("images", []):
+        rows.append(("Image", f'<code>{_e(i["image"])}</code> <span class="mute">{_e((i.get("id") or "")[:19])}</span>'))
+    times = " · ".join(f"{_e(s['label'].lower())} {_e(human_duration(s['seconds']))}"
+                       for s in stage_states(ev) if s["seconds"] is not None)
+    if times:
+        rows.append(("Timings", times))
+    env = ev.get("environment") or {}
+    rows += [("Isolation", f'{_e(env.get("isolation", ""))}. <span class="mute">{_e(env.get("strength", ""))}.</span>'),
+             ("Recovery time", _e(o.get("rto_basis", "not measured"))),
+             ("Data-loss window", _e(o.get("rpo_basis", "not measured"))),
+             ("Contract", f'<code>{_e(ev["contract"]["sha256"])}</code>')]
+    table = "".join(f'<tr><td class="k">{k}</td><td>{val}</td></tr>' for k, val in rows)
+    verify = ""
+    if file_sha:
+        verify = (f'<div class="verify">evidence.json sha256 {_e(file_sha)}</div>'
+                  f'<div class="verify">sha256sum -c evidence.sha256</div>')
+    return (f'<details><summary>Technical details<span class="s2">inputs, images, timings, integrity</span>'
+            f'</summary><div class="body"><table>{table}</table>{verify}</div></details>')
+
+
+def _numbers(ev: dict, n_pass: int, n_total: int, n_fail: int) -> str:
+    v = ev["verdict"]
+    o = ev.get("objectives") or {}
+    measured = o.get("measured_recovery_seconds")
+    t1_label = "Back online in" if v == "PASS" else "Restore and checks took"
+    t1_note = f"goal {o['rto_target_text']}" if o.get("rto_target_text") else "no goal set"
+    if v != "PASS" and measured is not None:
+        t1_note += " · not a full recovery"
+    elif o.get("rto_met"):
+        t1_note += " · met"
+    rpo = o.get("rpo_seconds")
+    if rpo is None:
+        t2_value, t2_note = "unknown", "no data timestamp in the contract"
+    else:
+        t2_value = f"last {_say(rpo)}"
+        if o.get("rpo_target_text"):
+            t2_note = f"limit {o['rpo_target_text']}"
+            if o.get("rpo_met") is True:
+                t2_note += " · met"
+            elif o.get("rpo_met") is False:
+                t2_note += " · over the limit"
+        else:
+            t2_note = "no limit set"
+    t3_note = f"{n_fail} failed" if n_fail else "all passed"
+    t1_value = _say(measured) if measured is not None else "—"
+
+    def tile(label, value, note):
+        return (f'<div class="num"><div class="nl">{label}</div><div class="nv">{_e(value)}</div>'
+                f'<div class="nn">{_e(note)}</div></div>')
+
+    return ('<section class="nums">' + tile(t1_label, t1_value, t1_note)
+            + tile("Data you'd lose", t2_value, t2_note)
+            + tile("Checks passed", f"{n_pass} of {n_total}", t3_note) + "</section>")
 
 
 def render_html(ev: dict, file_sha: str = "") -> str:
@@ -607,115 +663,56 @@ def render_html(ev: dict, file_sha: str = "") -> str:
     mandatory = [c for c in ev["checks"] if c["mandatory"]]
     n_pass = sum(1 for c in mandatory if c["status"] == "PASS")
     failed = failed_mandatory(ev)
-    n_skip = sum(1 for c in mandatory if c["status"] == "SKIPPED")
-    total = human_duration(ev.get("total_seconds"))
 
-    if v == "PASS":
-        note = f"{n_pass} of {len(mandatory)} mandatory checks passed"
-    elif v == "BLOCKED":
-        note = "the drill did not run"
-    elif failed:
-        note = f"{len(failed)} of {len(mandatory)} mandatory checks failed"
-    else:
-        note = f"{n_skip} of {len(mandatory)} mandatory checks not evaluated"
-
-    kv = (f'Recovery point <b>{_e(rp)}</b>Contract <b>{_e(ev["contract"]["sha256"][:12])}</b>'
-          f'Trigger <b>{_e(ev.get("trigger"))}</b>')
-    if ev.get("execution_status") and ev["execution_status"] != "COMPLETED":
-        kv += f'Execution <b>{_e(ev["execution_status"].lower())}</b>'
-
-    claim = ""
     if claimed.get("status"):
-        tested = (f"rebuilt from that backup and tested in {total}" if v in ("PASS", "PARTIAL", "FAIL")
-                  else f"stopped after {total}")
-        finished = _when(claimed.get("finished_at"))
-        claim = (f'<section class="claim" aria-label="Claim against finding"><div><span class="lbl">The backup job said'
-                 f'</span><span class="said">“{_e(claimed["status"])}”</span>'
-                 f'<span class="when">{_e("finished " + finished if finished else "finish time not recorded")}</span>'
-                 f'</div><div><span class="lbl">The drill found</span><span class="found">{_e(v)}</span>'
-                 f'<span class="when">{_e(tested)}</span></div></section>')
+        when = f' on {_e(_when(claimed["finished_at"]))}' if claimed.get("finished_at") else ""
+        lead = (f'Your backup job reported <span class="said">“{_e(claimed["status"])}”</span>{when}. '
+                "We rebuilt the app from that backup in a sealed sandbox with no internet, and tried it "
+                "the way a customer would.")
+    else:
+        lead = (f"We rebuilt the app from backup {_e(rp)} in a sealed sandbox with no internet, and tried it "
+                "the way a customer would.")
 
-    missing_paths = set()
-    for c in failed:
-        if c["kind"] == "reference":
-            missing_paths.update(m["path"] for m in (c.get("evidence") or {}).get("missing_sample", []))
-    findings = "".join(_finding(c, missing_paths) for c in failed)
-    if not findings:
-        findings = ('<p class="none"><span class="ok">✓</span> No findings. Every mandatory assertion in the '
-                    'Recovery Contract passed against this backup.</p>' if v == "PASS" else
-                    f'<p class="none">No mandatory check failed, but the verdict is {_e(v)}: '
-                    f'{_e(ev["verdict_reason"])}.</p>')
+    nums = "" if v == "BLOCKED" else _numbers(ev, n_pass, len(mandatory), len(failed))
+    step = next_step(ev)
+    fix = f'<section class="fix"><h2>Fix this first</h2><p>{_e(step)}</p></section>' if step else ""
 
-    ledger = ""
-    for c in ev["checks"]:
-        bad = c["status"] in ("FAIL", "ERROR")
-        gcls = {"PASS": "ok", "FAIL": "bad", "ERROR": "bad"}.get(c["status"], "m")
-        adv = "" if c["mandatory"] else '<span class="adv">advisory</span>'
-        ledger += (f'<tr><td class="{gcls}">{GLYPH.get(c["status"], "?")}</td>'
-                   f'<td class="m nw">{_e(STAGE_LABEL.get(c["stage"], c["stage"]))}</td>'
-                   f'<td><span{" class=bad" if bad else ""}>{_e(c["name"])}</span>{adv}<br>'
-                   f'<span class="m">{_e(c["summary"])}</span></td>'
-                   f'<td class="r m">{_e(human_duration(c["duration"])) if c.get("duration") is not None else ""}</td></tr>')
+    if failed:
+        items = "".join(f'<li><span class="g bad">✗</span><span>{_e(_cap(c["name"]))}'
+                        f'<span class="fact">{_e(short_finding(c))}</span></span></li>' for c in failed)
+        outcome = f'<ul class="list">{items}</ul>'
+    elif v == "PASS":
+        proven = [c for c in mandatory if c["kind"] in ("data", "reference", "journey")]
+        items = "".join(f'<li><span class="g ok">✓</span><span>{_e(_cap(c["name"]))}</span></li>' for c in proven)
+        outcome = f'<ul class="list">{items}</ul>' if items else ""
+    else:
+        outcome = ""
 
-    arts = ""
-    for a in ev.get("artifacts", []):
-        if a.get("expected_sha256"):
-            match = ('<span class="ok">matches</span>' if a["expected_sha256"] == a["sha256"]
-                     else '<span class="bad">does not match</span>')
-        else:
-            match = '<span class="m">not recorded</span>'
-        arts += (f'<tr><td>{_e(a["file"])}</td><td class="r">{a["bytes"]:,}</td>'
-                 f'<td class="m" title="{_e(a["sha256"])}">{_e(a["sha256"][:16])}…</td><td>{match}</td></tr>')
-    imgs = "".join(f'<tr><td>{_e(i["image"])}</td><td class="m">{_e((i.get("id") or "unknown")[:19])}…</td></tr>'
-                   for i in ev.get("images", []))
-    o = ev.get("objectives") or {}
-    env = ev.get("environment") or {}
-    prov = ""
-    if arts:
-        prov += (f'<div class="wrap"><table class="tb" style="min-width:600px"><thead><tr><th>Backup artifact</th>'
-                 f'<th class="r">Bytes</th><th>sha256</th><th>Against the backup job\'s record</th></tr></thead>'
-                 f'<tbody>{arts}</tbody></table></div>')
-    if imgs:
-        prov += (f'<div class="wrap"><table class="tb" style="min-width:480px"><thead><tr><th>Image</th>'
-                 f'<th>Pinned digest</th></tr></thead><tbody>{imgs}</tbody></table></div>')
-    prov += (f'<dl><dt class="lbl">Isolation</dt><dd><span>{_e(_cap(env.get("isolation", "not recorded")))}.</span>'
-             f'<span class="m">{_e(_cap(env.get("strength", "")))}{"." if env.get("strength") else ""}</span></dd>'
-             f'<dt class="lbl">Recovery time</dt><dd>{_e(_cap(o.get("rto_basis") or "not measured"))}.</dd>'
-             f'<dt class="lbl">Data-loss window</dt><dd>{_e(_cap(o.get("rpo_basis") or "not measured"))}.</dd>'
-             f'<dt class="lbl">Integrity</dt><dd><code>evidence.json sha256 {_e(file_sha)}</code>'
-             f'<code class="cmd">sha256sum -c evidence.sha256</code></dd></dl>')
+    files_html, missing_paths = _files_section(ev)
+    how = ""
+    if ev["checks"]:
+        how = (f'<details><summary>How we know<span class="s2">every check behind the verdict</span></summary>'
+               f'<div class="body">{_how_we_know(ev)}</div></details>')
+    more = ('<section class="more">' + how + files_html + _journey_section(ev, missing_paths)
+            + _technical(ev, file_sha) + "</section>")
 
+    art = _art()
+    art_img = f'<img src="data:image/jpeg;base64,{art}" alt="">' if art else ""
+    vcolor = palette.verdict_color(v)
+    vcolor_light = palette.verdict_color(v, palette.LIGHT)
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="dark light">
-<title>{_e(ev['app'])} · {_e(v)} · RestoreProof</title>
-<style>{_fonts()}{_css()}</style></head>
-<body style="--v:var(--{palette.VERDICT_KEY.get(v, 'neutral')})"><main class="page">
-<header class="top"><span class="mark">RESTOREPROOF<span>recovery evidence</span></span>
-<span class="meta">{_e(ev['run_id'])} · {_e(_when(ev.get('started_at')))}</span></header>
-
-<section class="case" aria-label="Case"><div class="who"><h1>{_e(ev['app'])}</h1>
-{f'<p class="desc">{_e(ev["description"])}</p>' if ev.get('description') else ''}
-<p class="kv">{kv}</p></div>
-<div class="verdict"><span class="vw">{_e(v)}</span><span class="vn">{_e(note)}</span></div></section>
-
-<p class="headline">{_e(headline(ev))}</p>
-{claim}
-
-<section><h2><span class="n">01</span>Objectives</h2><div class="wrap"><table class="tb" style="min-width:520px">
-<thead><tr><th>Objective</th><th class="r">Measured</th><th class="r">Target</th><th>Result</th></tr></thead>
-<tbody>{_objectives(ev, len(mandatory), n_pass, len(failed), n_skip)}</tbody></table></div></section>
-
-<section><h2><span class="n">02</span>Findings</h2>{findings}</section>
-
-<section><h2><span class="n">03</span>The drill, to scale</h2>{_timeline(ev)}</section>
-
-<section><h2><span class="n">04</span>Every assertion, in order</h2><div class="wrap"><table class="tb" style="min-width:600px">
-<thead><tr><th style="width:18px"></th><th style="width:96px">Stage</th><th>Assertion and what was observed</th>
-<th class="r" style="width:64px">Took</th></tr></thead><tbody>{ledger}</tbody></table></div></section>
-
-<section><h2><span class="n">05</span>Provenance</h2>{prov}</section>
-
-<footer><span>Verdicts come from deterministic assertions. <span class="ink">No language model decides a result.</span></span>
-<span>RestoreProof {_e(__version__)} · a Hermes Agent plugin</span></footer>
+<title>{_e(ev['app'])} · {_e(status_phrase(v))} · RestoreProof</title>
+<style>{_fonts()}{_css()}
+:root{{--v:{vcolor};{css_vars({('hb_' + k): val for k, val in palette.HALFTONE.items()})}}}
+@media (prefers-color-scheme:light){{:root{{--v:{vcolor_light}}}}}</style></head>
+<body><main class="page">
+<header class="mast">{art_img}<div class="in"><span class="mark">RESTOREPROOF</span>
+<span class="meta">{_e(_when(ev.get('started_at')))} · backup {_e(rp)}</span></div></header>
+<div class="app">{_e(ev['app'])}</div>
+<div class="status"><span class="dot"></span><span class="phrase">{_e(status_phrase(v))}</span><span class="vw">{_e(v)}</span></div>
+<h1>{_e(headline(ev))}</h1>
+<p class="lead">{lead}</p>
+{nums}{fix}{outcome}{more}
+<footer>Every verdict here comes from deterministic checks; no AI decides a result. RestoreProof {_e(__version__)}, a Hermes Agent plugin.</footer>
 </main></body></html>"""

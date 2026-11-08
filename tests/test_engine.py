@@ -273,9 +273,13 @@ class ReportTests(unittest.TestCase):
 
     def test_design_rules_hold(self):
         page = self.report.render_html(evidence("PARTIAL"), "f" * 64)
-        for banned in ("border-left:3px", "rotate(", "color-mix", "border-radius", "gradient", "box-shadow",
-                       "Segoe UI"):
+        for banned in ("border-left:3px", "rotate(", "color-mix", "gradient", "box-shadow"):
             self.assertNotIn(banned, page, banned)
+
+    def test_masthead_is_embedded_and_the_page_stays_small(self):
+        page = self.report.render_html(evidence("PARTIAL"), "f" * 64)
+        self.assertIn('src="data:image/jpeg;base64,', page)  # one self-contained file, no network fetch
+        self.assertLess(len(page.encode("utf-8")), 200_000)
 
     def test_the_backup_jobs_claim_is_quoted_never_colored(self):
         page = self.report.render_html(evidence("PARTIAL"), "")

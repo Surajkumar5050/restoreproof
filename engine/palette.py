@@ -46,6 +46,16 @@ LIGHT = {
     "neutral": "#6b6560",
 }
 
+# The Hermes marketplace's halftone look: electric-blue dots on pale paper, used for RestoreProof's art
+# (the report masthead and the store cover) and nowhere else.
+HALFTONE = {
+    "ground": "#2234f5",   # masthead panel beside the art
+    "dots": "#2234f5",     # halftone ink
+    "paper": "#e7e9ff",    # halftone paper
+    "ink": "#ffffff",      # wordmark on the panel
+    "ink_2": "#d4d9ff",    # date line on the panel
+}
+
 VERDICT_KEY = {"PASS": "ok", "PARTIAL": "warn", "FAIL": "err", "BLOCKED": "neutral", "INCONCLUSIVE": "neutral"}
 
 

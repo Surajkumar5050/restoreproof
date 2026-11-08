@@ -13,13 +13,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import databases
 from .util import canonical_json, load_yaml_text, parse_duration, parse_time, sha256_bytes
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}$")
 ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
-TEMPLATE_RE = re.compile(r"\{(db\.(?:host|port|user|password|name)|secret\.[A-Z_][A-Z0-9_]*)\}")
-SUPPORTED_DB = {"postgres"}
-DB_ARTIFACT_SUFFIXES = (".sql", ".sql.gz", ".dump", ".pgdump")
+TEMPLATE_RE = re.compile(r"\{(db\.(?:host|port|user|password|name|path)|secret\.[A-Z_][A-Z0-9_]*)\}")
+SUPPORTED_DB = tuple(databases.ENGINES)
+SERVER_PLACEHOLDERS = {"db.host", "db.port", "db.user", "db.password", "db.name"}
+MONGO_WRITES = re.compile(
+    r"(?i)\b(insert\w*|update\w*|delete\w*|remove|drop\w*|replace\w*|create\w*|rename\w*|bulkWrite|"
+    r"findOneAnd\w*|runCommand|adminCommand|eval|load)\s*\(|\$(out|merge)\b")
 FILE_ARTIFACT_SUFFIXES = (".tar", ".tar.gz", ".tgz")
 METHODS = {"GET", "HEAD", "POST"}
 EXPECT_KEYS = {"min", "max", "equals"}
@@ -138,6 +142,27 @@ def _sql(value: Any, where: str, errors: list[str]) -> str | None:
     return q
 
 
+def _mongo(value: Any, where: str, errors: list[str]) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        errors.append(f"{where} must be a mongosh expression, for example db.customers.countDocuments()")
+        return None
+    q = value.strip().rstrip(";").strip()
+    if ";" in q:
+        errors.append(f"{where} must be a single expression")
+    if MONGO_WRITES.search(q):
+        errors.append(f"{where} must only read (no insert, update, delete, drop, $out or $merge)")
+    return q
+
+
+def _query(c: dict, key: str, where: str, errors: list[str], engine: str) -> str | None:
+    """A check's query: `sql` for SQL databases, `query` for MongoDB (either name is accepted)."""
+    value = c.get(key, c.get("query" if key == "sql" else key.replace("_sql", "_query")))
+    if engine == "mongodb":
+        return _mongo(value, where.replace("_sql", "_query").removesuffix(".sql") + (".query" if where.endswith(".sql") else ""),
+                      errors)
+    return _sql(value, where, errors)
+
+
 def normalise(raw: dict) -> tuple[dict, list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
@@ -156,15 +181,26 @@ def normalise(raw: dict) -> tuple[dict, list[str], list[str]]:
 
     db = _mapping(raw.get("database"), "database", errors)
     engine = _str(db, "engine", errors, "database", default="postgres")
+    if engine == "mongo":
+        engine = "mongodb"
     if engine and engine not in SUPPORTED_DB:
-        errors.append(f"database.engine '{engine}' is not supported yet (supported: postgres)")
+        errors.append(f"database.engine '{engine}' is not supported (supported: {', '.join(SUPPORTED_DB)})")
+        engine = "postgres"
+    adapter = databases.get(engine or "postgres")
     db_artifact = _str(db, "artifact", errors, "database")
-    if db_artifact and not db_artifact.lower().endswith(DB_ARTIFACT_SUFFIXES):
-        errors.append(f"database.artifact must end with one of {DB_ARTIFACT_SUFFIXES}")
-    for key in ("name", "user"):
-        val = db.get(key, "app")
-        if not isinstance(val, str) or not re.match(r"^[a-z_][a-z0-9_]{0,62}$", val):
-            errors.append(f"database.{key} must be a simple lowercase identifier")
+    if db_artifact and not db_artifact.lower().endswith(adapter.artifact_suffixes):
+        errors.append(f"database.artifact for {adapter.label} must end with one of "
+                      f"{', '.join(adapter.artifact_suffixes)}")
+    if adapter.server:
+        for key in ("name", "user"):
+            val = db.get(key, "app")
+            if not isinstance(val, str) or not re.match(r"^[a-z_][a-z0-9_]{0,62}$", val):
+                errors.append(f"database.{key} must be a simple lowercase identifier")
+    db_mount = db.get("mount")
+    if not adapter.server:
+        if not isinstance(db_mount, str) or not db_mount.startswith("/") or ".." in db_mount.split("/")                 or db_mount.endswith("/"):
+            errors.append("database.mount is required for SQLite: the absolute file path the app opens, "
+                          "for example /data/app.db")
 
     files = []
     seen = set()
@@ -210,6 +246,10 @@ def normalise(raw: dict) -> tuple[dict, list[str], list[str]]:
         for ref in re.findall(r"\{([^{}]+)\}", v):
             if not TEMPLATE_RE.fullmatch("{" + ref + "}"):
                 errors.append(f"service.env.{k} uses unknown placeholder {{{ref}}}")
+            elif not adapter.server and ref in SERVER_PLACEHOLDERS:
+                errors.append(f"service.env.{k} uses {{{ref}}}, but SQLite has no server; use {{db.path}}")
+            elif adapter.server and ref == "db.path":
+                errors.append(f"service.env.{k} uses {{db.path}}, which is only for SQLite")
             elif ref.startswith("secret.") and ref[7:] not in secret_names:
                 errors.append(f"service.env.{k} uses {{{ref}}} but '{ref[7:]}' is not listed in service.secrets")
         env_out[str(k)] = v
@@ -222,7 +262,7 @@ def normalise(raw: dict) -> tuple[dict, list[str], list[str]]:
         c = _mapping(c, where, errors)
         data_checks.append({
             "name": _str(c, "name", errors, where),
-            "sql": _sql(c.get("sql"), where + ".sql", errors),
+            "sql": _query(c, "sql", where + ".sql", errors, engine),
             "expect": _expect(c.get("expect"), where + ".expect", errors),
             "mandatory": bool(c.get("mandatory", True)),
         })
@@ -234,7 +274,7 @@ def normalise(raw: dict) -> tuple[dict, list[str], list[str]]:
             errors.append(f"{where}.files '{target}' does not match any files[].name")
         ref_checks.append({
             "name": _str(c, "name", errors, where),
-            "sql": _sql(c.get("sql"), where + ".sql", errors),
+            "sql": _query(c, "sql", where + ".sql", errors, engine),
             "files": target,
             "strip_prefix": str(c.get("strip_prefix") or ""),
             "mandatory": bool(c.get("mandatory", True)),
@@ -294,9 +334,9 @@ def normalise(raw: dict) -> tuple[dict, list[str], list[str]]:
         errors.append("objectives.rto must be a duration like 15m")
     if obj.get("rpo") is not None and rpo is None:
         errors.append("objectives.rpo must be a duration like 24h")
-    watermark = obj.get("rpo_watermark_sql")
-    if watermark is not None:
-        watermark = _sql(watermark, "objectives.rpo_watermark_sql", errors)
+    watermark = None
+    if obj.get("rpo_watermark_sql") is not None or obj.get("rpo_watermark_query") is not None:
+        watermark = _query(obj, "rpo_watermark_sql", "objectives.rpo_watermark_sql", errors, engine)
     incident = obj.get("incident_time")
     if incident is not None and parse_time(incident) is None:
         errors.append("objectives.incident_time must be an ISO 8601 timestamp")
@@ -312,9 +352,10 @@ def normalise(raw: dict) -> tuple[dict, list[str], list[str]]:
         "app": {"name": name, "description": app.get("description", ""), "owner": app.get("owner", "")},
         "recovery_point": {"label": rp.get("label"), "dir": rp.get("dir"),
                            "status_file": rp.get("status_file")},
-        "database": {"engine": engine, "image": db.get("image") or "postgres:16-alpine",
+        "database": {"engine": engine, "image": db.get("image") or adapter.default_image,
                      "artifact": db_artifact, "sha256": db.get("sha256"),
                      "name": db.get("name", "app"), "user": db.get("user", "app"),
+                     "mount": db_mount if not adapter.server else None,
                      "covers_volume": db.get("covers_volume")},
         "files": files,
         "service": {"image": image, "port": port if isinstance(port, int) else 8080, "health": health,

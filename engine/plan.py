@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from . import archive
+from . import archive, databases
 from .contract import Contract
 from .docker import Docker
 from .runner import PROBE_IMAGE
@@ -57,7 +57,7 @@ def preflight_plan(contract: Contract, recovery_dir: str | Path | None = None,
             reads.append(entry)
 
     images = []
-    for image in (d["database"]["image"], d["service"]["image"], PROBE_IMAGE):
+    for image in dict.fromkeys((d["database"]["image"], d["service"]["image"], PROBE_IMAGE)):
         present = ok and docker.image_info(image) is not None
         images.append({"image": image, "present_locally": present})
         if ok and not present:
@@ -78,7 +78,9 @@ def preflight_plan(contract: Contract, recovery_dir: str | Path | None = None,
         "will_read": reads,
         "will_create": [
             "1 docker network with --internal (no internet egress)",
-            f"1 PostgreSQL container ({d['database']['image']}, memory {d['limits']['db_memory']})",
+            (f"1 {databases.get(d['database']['engine']).label} container ({d['database']['image']}, memory "
+             f"{d['limits']['db_memory']})" if databases.get(d['database']['engine']).server
+             else f"1 container ({d['database']['image']}) that holds the restored SQLite file for the checks"),
             f"1 app container ({d['service']['image']}, memory {d['limits']['app_memory']}, cap-drop ALL)",
             f"1 probe container ({PROBE_IMAGE}, memory 128m) that runs the journeys inside the network",
             "a scratch folder for extracted files, deleted after the drill",
