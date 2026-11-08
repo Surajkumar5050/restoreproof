@@ -6,7 +6,6 @@ plugin's own data directory; nothing here can start a drill or touch Docker.
 
 from __future__ import annotations
 
-import base64
 import importlib.util
 import json
 import re
@@ -131,11 +130,3 @@ def report_html(run_id: str):
         html = path.read_text(encoding="utf-8")
     return {"run_id": ev["run_id"], "path": str(path), "html": html}
 
-
-@router.get("/art")
-def art():
-    """The halftone Hermes emblem the drill view shows in its header (the report's masthead image)."""
-    path = Path(__file__).resolve().parents[1] / "engine" / "report_art.jpg"
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="no art")
-    return {"jpeg": base64.b64encode(path.read_bytes()).decode("ascii")}

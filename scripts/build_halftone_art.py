@@ -9,11 +9,15 @@ Needs Pillow and numpy. Colors come from engine/palette.py (HALFTONE). Writes:
 
   engine/report_art.jpg   the evidence report's masthead (head and neck)
   assets/banner.jpg       2:1 cover for the README and the plugin catalog
+  desktop/plugin.js       its EMBLEM constant: the masthead cropped to the face, inlined
 """
 
 from __future__ import annotations
 
+import base64
+import io
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -145,11 +149,31 @@ def cover(src: Path) -> Image.Image:
     return canvas
 
 
+def emblem(art: Image.Image) -> str:
+    """The Desktop pane banner and drill-view badge: the masthead cropped around the face, as a data URL."""
+    w, h = art.size
+    band = round(w / 2.8)  # the pane shows it 2.8:1; the badge crops the same image square
+    top = round(h * 0.40 - band / 2)
+    buf = io.BytesIO()
+    art.crop((0, top, w, top + band)).save(buf, "JPEG", quality=78, optimize=True, progressive=True)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def write_emblem(url: str) -> None:
+    plugin = ROOT / "desktop" / "plugin.js"
+    text = plugin.read_text(encoding="utf-8")
+    new, n = re.subn(r"^const EMBLEM = '[^']*'$", f"const EMBLEM = '{url}'", text, flags=re.M)
+    assert n == 1, "desktop/plugin.js needs exactly one `const EMBLEM = '...'` line"
+    plugin.write_text(new, encoding="utf-8")
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         sys.exit(__doc__)
     src = Path(sys.argv[1]) / "hermes.jpg"
-    masthead(src).save(ROOT / "engine" / "report_art.jpg", quality=82, optimize=True, progressive=True)
+    art = masthead(src)
+    art.save(ROOT / "engine" / "report_art.jpg", quality=82, optimize=True, progressive=True)
+    write_emblem(emblem(art))
     cover(src).save(ROOT / "assets" / "banner.jpg", quality=88, optimize=True, progressive=True)
     for f in (ROOT / "engine" / "report_art.jpg", ROOT / "assets" / "banner.jpg"):
         print(f"{f.relative_to(ROOT)}  {f.stat().st_size // 1024} KB  {Image.open(f).size}")
